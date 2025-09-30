@@ -1,0 +1,9 @@
+﻿streamlit
+pandas
+numpy
+plotly
+sqlalchemy>=2.0
+pydantic
+pyyaml
+python-dateutil
+pyodbc
