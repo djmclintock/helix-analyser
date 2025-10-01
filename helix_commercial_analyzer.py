@@ -5,14 +5,16 @@ Helix Commercial Analyzer — Streamlit MVP
 - Plotly: use config= (no deprecated kwargs)
 - Pydantic v2 (@field_validator)
 - Connection diagnostics
-- NEW: Read server profiles from either:
+- Reads server profiles from:
     1) Secrets UI (preferred), or
-    2) .streamlit/secrets.toml in the repo (fallback)
+    2) .streamlit/secrets.toml in the repo (fallback), else
+    3) helix_config.yaml
+- FIX: Cache functions now take URL strings (hashable) instead of Engine objects.
 """
 
 from __future__ import annotations
 
-import json, os, sys
+import json, os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -49,7 +51,7 @@ except Exception:
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
 
 def _get_dbapi() -> str:
-    # Prefer Secrets UI key; fall back to env var; default pyodbc
+    # Prefer Secrets UI; then env var; default pyodbc
     try:
         sec_val = st.secrets.get("HELIX_DBAPI", None)
         if isinstance(sec_val, str) and sec_val.strip():
@@ -93,7 +95,6 @@ class AppConfig:
 # -------------------------- Load profiles --------------------------
 
 def _profiles_from_secrets_ui() -> List[ServerProfile]:
-    """Read from Streamlit Secrets UI: st.secrets['servers']"""
     try:
         sec = st.secrets.get("servers", {})
     except Exception:
@@ -113,11 +114,6 @@ def _profiles_from_secrets_ui() -> List[ServerProfile]:
     return out
 
 def _profiles_from_secrets_file() -> List[ServerProfile]:
-    """
-    Fallback: parse .streamlit/secrets.toml in repo.
-    NOTE: On Streamlit Cloud this file is normally ignored by the platform,
-    but we parse it ourselves here to help when Secrets UI isn’t available.
-    """
     path = os.path.join(".streamlit", "secrets.toml")
     if not os.path.exists(path) or tomllib is None:
         return []
@@ -160,11 +156,8 @@ def _profiles_from_yaml(path: str) -> Tuple[List[ServerProfile], Dict[str, Any]]
     return servers, options
 
 def load_config(path: str) -> AppConfig:
-    # 1) Secrets UI
     s1 = _profiles_from_secrets_ui()
-    # 2) Repo secrets file fallback
     s2 = _profiles_from_secrets_file() if not s1 else []
-    # 3) YAML (last resort)
     y_servers, y_opts = _profiles_from_yaml(path)
 
     if s1:
@@ -255,10 +248,16 @@ def run_sql(profile: ServerProfile, sql: str, params: Optional[Dict[str, Any]] =
         return demo_dataset()
     return run_sql_cached(url, sql, params, limit)
 
-# -------------------------- COMM/VW listing --------------------------
+# -------------------------- COMM/VW listing (URL-based cache) --------------------------
 
 @st.cache_data(ttl=300, show_spinner=False)
-def list_comm_vw_objects(engine: Optional[Engine]) -> pd.DataFrame:
+def list_comm_vw_objects(url: str) -> pd.DataFrame:
+    """
+    Cached by URL (hashable). Internally uses the cached Engine.
+    """
+    if not url:
+        return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
+    engine = get_engine_for_url(url)
     if engine is None:
         return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
     try:
@@ -296,7 +295,13 @@ def list_comm_vw_objects(engine: Optional[Engine]) -> pd.DataFrame:
         return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
 
 @st.cache_data(ttl=120, show_spinner=False)
-def preview_object(engine: Optional[Engine], schema: str, name: str, limit: int) -> pd.DataFrame:
+def preview_object(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
+    """
+    Cached by URL + identifiers (all hashable). Internally uses the cached Engine.
+    """
+    if not url:
+        return pd.DataFrame()
+    engine = get_engine_for_url(url)
     if engine is None:
         return pd.DataFrame()
     dialect = engine.dialect.name.lower()
@@ -412,7 +417,7 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
 
 # -------------------------- Sidebar --------------------------
 
-def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[Engine]]:
+def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[Engine], str]:
     st.sidebar.title("Helix Commercial Analyzer")
     st.sidebar.caption("Select your server and options")
     if not config.servers:
@@ -474,7 +479,7 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[E
         except Exception as e:
             st.sidebar.error(f"Invalid JSON: {e}")
 
-    return profile, st.session_state.get("allow_unsafe_sql", False), engine
+    return profile, st.session_state.get("allow_unsafe_sql", False), engine, url
 
 # -------------------------- Page sections --------------------------
 
@@ -585,7 +590,7 @@ def main():
     st.set_page_config(page_title="Helix Commercial Analyzer", layout="wide")
 
     config = load_config(CONFIG_PATH)
-    profile, _, engine = sidebar_controls(config)
+    profile, _, engine, url = sidebar_controls(config)
 
     # Reset state when server changes
     cur_key = connection_key(profile)
@@ -596,10 +601,10 @@ def main():
         st.session_state.pop("last_sql", None)
         st.cache_data.clear()
 
-    # COMM/VW picker
+    # COMM/VW picker (now URL-based)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Choose COMM/VW table/view")
-    objs = list_comm_vw_objects(engine)
+    objs = list_comm_vw_objects(url)
     if objs.empty:
         st.sidebar.info("No objects matching comm* (excluding commercial*) or vw*.")
     else:
@@ -619,12 +624,12 @@ def main():
             cA, cB = st.sidebar.columns(2)
             with cA:
                 if st.button("Preview"):
-                    st.dataframe(preview_object(engine, sel["schema_name"], sel["object_name"], int(n)))
+                    st.dataframe(preview_object(url, sel["schema_name"], sel["object_name"], int(n)))
             with cB:
                 if st.button("Use in Query"):
                     st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{sel['schema_name']}].[{sel['object_name']}]"
                     try:
-                        st.session_state["last_df"] = preview_object(engine, sel["schema_name"], sel["object_name"], 1000)
+                        st.session_state["last_df"] = preview_object(url, sel["schema_name"], sel["object_name"], 1000)
                         st.success("Query editor updated from selection.")
                     except Exception as e:
                         st.warning(str(e)[:300])
