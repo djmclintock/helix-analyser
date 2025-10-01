@@ -4,8 +4,8 @@ Helix Commercial Analyzer — Streamlit MVP
 
 Updates in this version
 -----------------------
-- Streamlit: replaced `use_container_width` with `width="stretch"`
-- Pydantic: switched `@validator` -> `@field_validator` and `.json()` -> `.model_dump_json()`
+- Plotly in Streamlit: use `config={...}` and avoid extra keyword args to st.plotly_chart
+- Pydantic v2: uses @field_validator and .model_dump_json()
 """
 
 from __future__ import annotations
@@ -441,15 +441,18 @@ def aggregate(df: pd.DataFrame, x: Optional[str], y: Optional[str], group: Optio
 
 
 def render_chart(df: pd.DataFrame, spec: TileSpec):
+    # Plotly config: keep UI consistent and responsive
+    cfg = {"responsive": True, "displaylogo": False, "toImageButtonOptions": {"format": "png"}}
+
     if spec.chart_type == "table":
-        st.dataframe(df, width="stretch")
+        st.dataframe(df)  # Streamlit tables aren't part of the Plotly warning
         return
 
     if spec.chart_type == "pie":
         if spec.group and spec.y:
             aggdf = df.groupby(spec.group, dropna=False)[spec.y].sum().reset_index()
             fig = px.pie(aggdf, names=spec.group, values=spec.y, title=spec.title)
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, config=cfg)
         else:
             st.warning("Pie requires 'group' and 'y' fields.")
         return
@@ -463,7 +466,10 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
         fig = px.area(plotdf, x=spec.x, y=spec.y, color=spec.group, title=spec.title)
     else:  # scatter
         fig = px.scatter(plotdf, x=spec.x, y=spec.y, color=spec.group, title=spec.title)
-    st.plotly_chart(fig, width="stretch")
+
+    # Tighten margins so it looks good in the app
+    fig.update_layout(margin=dict(l=8, r=8, t=48, b=8))
+    st.plotly_chart(fig, config=cfg)
 
 
 # ---------------------------
@@ -534,7 +540,7 @@ def section_query(profile: ServerProfile):
         st.session_state["last_df"] = df
 
     df = st.session_state.get("last_df", demo_dataset())
-    st.dataframe(df.head(1000), width="stretch")
+    st.dataframe(df)
     st.caption(f"Rows in memory: {len(df):,}")
     return df
 
@@ -704,7 +710,7 @@ def main():
             with colA:
                 if st.button("Preview"):
                     df_preview = preview_object(engine, schema_name, object_name, int(preview_limit))
-                    st.dataframe(df_preview, width="stretch")
+                    st.dataframe(df_preview)
             with colB:
                 if st.button("Use in Query"):
                     st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{schema_name}].[{object_name}]"
