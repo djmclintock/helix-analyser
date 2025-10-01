@@ -7,3 +7,4 @@ pydantic
 pyyaml
 python-dateutil
 python-tds
+sqlalchemy-pytds
