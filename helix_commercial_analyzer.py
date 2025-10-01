@@ -5,7 +5,7 @@ Helix Commercial Analyzer — Streamlit MVP
 - Per-server caching & server-change reset
 - Plotly config arg (no deprecated kwargs)
 - Pydantic v2 field_validator
-- NEW: Connection Status panel (diagnostics)
+- Connection Status + Profiles Loaded diagnostics
 """
 
 from __future__ import annotations
@@ -101,10 +101,18 @@ def load_config(path: str) -> AppConfig:
                 cfg = yaml.safe_load(f)
         except Exception:
             cfg = None
+
     yaml_servers = [ServerProfile(**s) for s in (cfg or {}).get("servers", [])]
     options = (cfg or {}).get("options", {"allow_unsafe_sql": False})
+
     secrets_servers = load_servers_from_secrets()
     servers = secrets_servers if secrets_servers else yaml_servers
+
+    # --- Diagnostics: record where profiles came from ---
+    st.session_state["profiles_source"] = "secrets" if secrets_servers else "yaml"
+    st.session_state["profiles_from_secrets"] = [s.name for s in secrets_servers]
+    st.session_state["profiles_from_yaml"] = [s.name for s in yaml_servers]
+
     return AppConfig(servers=servers, options=options)
 
 # -------------------------- Connectivity --------------------------
@@ -147,7 +155,6 @@ def try_connect(engine: Optional[Engine]) -> Tuple[bool, str]:
             conn.exec_driver_sql("SELECT 1")
         return True, ""
     except Exception as e:
-        # sanitize message (avoid credentials)
         msg = str(e)
         for k in ["UID", "PWD", "username", "password"]:
             msg = msg.replace(k, "***")
@@ -213,7 +220,6 @@ def list_comm_vw_objects(engine: Optional[Engine]) -> pd.DataFrame:
                 """)
             return pd.read_sql(sql, conn)
     except Exception:
-        # swallow errors here; diagnostics panel will show them
         return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -333,7 +339,7 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
 
 # -------------------------- Sidebar --------------------------
 
-def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool]:
+def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[Engine]]:
     st.sidebar.title("Helix Commercial Analyzer")
     st.sidebar.caption("Select your server and options")
     if not config.servers:
@@ -348,9 +354,26 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool]:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Connection status")
     st.sidebar.caption(f"DBAPI: **{DBAPI}**")
+
+    # Diagnostics: which source provided profiles
+    src = st.session_state.get("profiles_source")
+    st.sidebar.caption(f"Profiles source: **{src}**")
+    with st.sidebar.expander("Profiles from Secrets"):
+        st.write(", ".join(st.session_state.get("profiles_from_secrets", [])) or "—")
+    with st.sidebar.expander("Profiles from YAML"):
+        st.write(", ".join(st.session_state.get("profiles_from_yaml", [])) or "—")
+
+    # Field presence for current profile (safe; no values)
+    st.sidebar.write(
+        "Fields present — "
+        f"Host: {'✅' if profile.host else '—'} · "
+        f"DB: {'✅' if profile.database else '—'} · "
+        f"User: {'✅' if profile.username else '—'} · "
+        f"Pwd: {'✅' if profile.password else '—'}"
+    )
+
     url = get_sqlalchemy_url(profile)
-    creds_present = bool(url)
-    st.sidebar.write(f"Credentials present: **{'Yes' if creds_present else 'No'}**")
+    st.sidebar.write(f"Credentials present: **{'Yes' if bool(url) else 'No'}**")
     engine = get_engine_for_url(url) if url else None
     ok, err = try_connect(engine)
     if ok:
