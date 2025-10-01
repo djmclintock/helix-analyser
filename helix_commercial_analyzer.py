@@ -2,20 +2,10 @@
 Helix Commercial Analyzer — Streamlit MVP
 (with Synapse profiles, Secrets support, Cloud-friendly DBAPI, COMM/VW picker, and per-server caching)
 
-What you get
-------------
-- Server selector (Azure Synapse/SQL) from YAML or Streamlit Secrets
-- COMM/VW object picker (tables, external tables, views) with filter + preview
-- Query runner (SELECT-only by default) with demo fallback
-- Chart Builder (line/bar/area/scatter/pie/table) + filters
-- Dashboard composer (tiles) + save/load JSON
-- KPI rail (LNG-flavoured demo metrics)
-
-Cloud vs Local
---------------
-- Local: default DBAPI = pyodbc (needs Microsoft ODBC Driver 18)
-- Cloud (Streamlit Community Cloud): set HELIX_DBAPI=pytds and add creds via Secrets;
-  requirements.txt should include python-tds
+Updates in this version
+-----------------------
+- Streamlit: replaced `use_container_width` with `width="stretch"`
+- Pydantic: switched `@validator` -> `@field_validator` and `.json()` -> `.model_dump_json()`
 """
 
 from __future__ import annotations
@@ -29,7 +19,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from urllib.parse import quote_plus
 
 import sqlalchemy as sa
@@ -395,8 +385,9 @@ class TileSpec(BaseModel):
     agg: Optional[str] = Field("sum", description="sum|mean|min|max|count")
     filters: Dict[str, Any] = Field(default_factory=dict)
 
-    @validator("chart_type")
-    def _check_chart(cls, v):
+    @field_validator("chart_type")
+    @classmethod
+    def _check_chart(cls, v: str) -> str:
         allowed = {"line", "bar", "area", "scatter", "pie", "table"}
         if v not in allowed:
             raise ValueError(f"chart_type must be one of {allowed}")
@@ -451,14 +442,14 @@ def aggregate(df: pd.DataFrame, x: Optional[str], y: Optional[str], group: Optio
 
 def render_chart(df: pd.DataFrame, spec: TileSpec):
     if spec.chart_type == "table":
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
         return
 
     if spec.chart_type == "pie":
         if spec.group and spec.y:
             aggdf = df.groupby(spec.group, dropna=False)[spec.y].sum().reset_index()
             fig = px.pie(aggdf, names=spec.group, values=spec.y, title=spec.title)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("Pie requires 'group' and 'y' fields.")
         return
@@ -472,7 +463,7 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
         fig = px.area(plotdf, x=spec.x, y=spec.y, color=spec.group, title=spec.title)
     else:  # scatter
         fig = px.scatter(plotdf, x=spec.x, y=spec.y, color=spec.group, title=spec.title)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ---------------------------
@@ -531,7 +522,7 @@ def section_query(profile: ServerProfile):
     with cols[0]:
         limit = st.number_input("Row limit", 1000, 500000, 50000, step=1000)
     with cols[1]:
-        run_btn = st.button("Run query", type="primary")
+        run_btn = st.button("Run query")
     with cols[2]:
         use_demo = st.toggle("Use demo data", value=False)
     with cols[3]:
@@ -543,7 +534,7 @@ def section_query(profile: ServerProfile):
         st.session_state["last_df"] = df
 
     df = st.session_state.get("last_df", demo_dataset())
-    st.dataframe(df.head(1000), use_container_width=True)
+    st.dataframe(df.head(1000), width="stretch")
     st.caption(f"Rows in memory: {len(df):,}")
     return df
 
@@ -589,7 +580,7 @@ def section_chart_builder(df: pd.DataFrame) -> TileSpec:
             if selected:
                 filters[c] = selected
 
-    build = st.button("Add tile to dashboard", type="primary")
+    build = st.button("Add tile to dashboard")
     current_sql = st.session_state.get("last_sql")
 
     spec = TileSpec(title=title or "Untitled", chart_type=chart_type, dataset_sql=current_sql, x=x, y=y, group=group, agg=agg, filters=filters)
@@ -597,7 +588,7 @@ def section_chart_builder(df: pd.DataFrame) -> TileSpec:
     if build:
         dash: DashboardSpec = DashboardSpec(**st.session_state.get("dashboard_spec", {"title": "Commercial Dashboard", "tiles": []}))
         dash.tiles.append(spec)
-        st.session_state["dashboard_spec"] = json.loads(dash.json())
+        st.session_state["dashboard_spec"] = json.loads(dash.model_dump_json())
         st.success("Tile added.")
 
     st.subheader("Preview")
@@ -625,7 +616,7 @@ def section_dashboard(profile: ServerProfile):
             with cols[1]:
                 if st.button(f"Delete", key=f"del_{i}"):
                     tiles.pop(i)
-                    st.session_state["dashboard_spec"] = json.loads(DashboardSpec(title=dash.title, tiles=tiles).json())
+                    st.session_state["dashboard_spec"] = json.loads(DashboardSpec(title=dash.title, tiles=tiles).model_dump_json())
                     st.rerun()
             df = dataset_from_sql_or_demo(profile, t.dataset_sql)
             df = apply_filters(df, t.filters)
@@ -663,10 +654,8 @@ def main():
     prev_key = st.session_state.get("active_profile_key")
     if prev_key != cur_key:
         st.session_state["active_profile_key"] = cur_key
-        # Clear last results so UI reflects the newly selected server
         st.session_state.pop("last_df", None)
         st.session_state.pop("last_sql", None)
-        # Clear cached query results keyed to old URLs
         st.cache_data.clear()
 
     # Build a reusable Engine for metadata + previews (per-URL)
@@ -713,11 +702,11 @@ def main():
             preview_limit = st.sidebar.number_input("Preview rows", 10, 2000, 200, step=10)
             colA, colB = st.sidebar.columns(2)
             with colA:
-                if st.button("Preview", use_container_width=True):
+                if st.button("Preview"):
                     df_preview = preview_object(engine, schema_name, object_name, int(preview_limit))
-                    st.dataframe(df_preview, use_container_width=True)
+                    st.dataframe(df_preview, width="stretch")
             with colB:
-                if st.button("Use in Query", use_container_width=True):
+                if st.button("Use in Query"):
                     st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{schema_name}].[{object_name}]"
                     try:
                         df_quick = preview_object(engine, schema_name, object_name, 1000)
