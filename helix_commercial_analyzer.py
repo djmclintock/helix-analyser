@@ -1,16 +1,18 @@
 """
 Helix Commercial Analyzer — Streamlit MVP
-- Synapse profiles via Secrets/YAML
-- COMM/VW picker with preview
+- COMM/VW picker with preview + “Use in Query”
 - Per-server caching & server-change reset
-- Plotly config arg (no deprecated kwargs)
-- Pydantic v2 field_validator
-- Connection Status + Profiles Loaded diagnostics
+- Plotly: use config= (no deprecated kwargs)
+- Pydantic v2 (@field_validator)
+- Connection diagnostics
+- NEW: Read server profiles from either:
+    1) Secrets UI (preferred), or
+    2) .streamlit/secrets.toml in the repo (fallback)
 """
 
 from __future__ import annotations
 
-import json, os
+import json, os, sys
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -30,14 +32,33 @@ try:
 except Exception:
     yaml = None
 
+# TOML parser for fallback .streamlit/secrets.toml
+try:
+    import tomllib  # Py 3.11+
+except Exception:
+    tomllib = None
+
 try:
     from sqlalchemy import create_engine, text
 except Exception:
     create_engine = None
     text = None
 
+# -------------------------- Config --------------------------
+
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
-DBAPI = os.getenv("HELIX_DBAPI", "pyodbc").lower()  # set HELIX_DBAPI="pytds" in Cloud
+
+def _get_dbapi() -> str:
+    # Prefer Secrets UI key; fall back to env var; default pyodbc
+    try:
+        sec_val = st.secrets.get("HELIX_DBAPI", None)
+        if isinstance(sec_val, str) and sec_val.strip():
+            return sec_val.strip().lower()
+    except Exception:
+        pass
+    return os.getenv("HELIX_DBAPI", "pyodbc").lower()
+
+DBAPI = _get_dbapi()
 
 DEFAULT_CONFIG_YAML = """
 servers:
@@ -52,7 +73,7 @@ options:
   allow_unsafe_sql: false
 """
 
-# -------------------------- Models & Config --------------------------
+# -------------------------- Models --------------------------
 
 @dataclass
 class ServerProfile:
@@ -69,7 +90,10 @@ class AppConfig:
     servers: List[ServerProfile]
     options: Dict[str, Any]
 
-def load_servers_from_secrets() -> List[ServerProfile]:
+# -------------------------- Load profiles --------------------------
+
+def _profiles_from_secrets_ui() -> List[ServerProfile]:
+    """Read from Streamlit Secrets UI: st.secrets['servers']"""
     try:
         sec = st.secrets.get("servers", {})
     except Exception:
@@ -77,8 +101,34 @@ def load_servers_from_secrets() -> List[ServerProfile]:
     out: List[ServerProfile] = []
     if isinstance(sec, dict):
         for name, cfg in sec.items():
-            out.append(
-                ServerProfile(
+            out.append(ServerProfile(
+                name=name,
+                type=cfg.get("type", "synapse"),
+                host=cfg.get("host", ""),
+                database=cfg.get("database", ""),
+                username=cfg.get("username", ""),
+                password=cfg.get("password", ""),
+                driver=cfg.get("driver", "ODBC Driver 18 for SQL Server"),
+            ))
+    return out
+
+def _profiles_from_secrets_file() -> List[ServerProfile]:
+    """
+    Fallback: parse .streamlit/secrets.toml in repo.
+    NOTE: On Streamlit Cloud this file is normally ignored by the platform,
+    but we parse it ourselves here to help when Secrets UI isn’t available.
+    """
+    path = os.path.join(".streamlit", "secrets.toml")
+    if not os.path.exists(path) or tomllib is None:
+        return []
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        servers = data.get("servers", {})
+        out: List[ServerProfile] = []
+        if isinstance(servers, dict):
+            for name, cfg in servers.items():
+                out.append(ServerProfile(
                     name=name,
                     type=cfg.get("type", "synapse"),
                     host=cfg.get("host", ""),
@@ -86,32 +136,55 @@ def load_servers_from_secrets() -> List[ServerProfile]:
                     username=cfg.get("username", ""),
                     password=cfg.get("password", ""),
                     driver=cfg.get("driver", "ODBC Driver 18 for SQL Server"),
-                )
-            )
-    return out
+                ))
+        return out
+    except Exception:
+        return []
 
-def load_config(path: str) -> AppConfig:
+def _profiles_from_yaml(path: str) -> Tuple[List[ServerProfile], Dict[str, Any]]:
     cfg = None
     if yaml is not None:
         if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_CONFIG_YAML)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(DEFAULT_CONFIG_YAML)
+            except Exception:
+                pass
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
         except Exception:
             cfg = None
-
-    yaml_servers = [ServerProfile(**s) for s in (cfg or {}).get("servers", [])]
+    servers = [ServerProfile(**s) for s in (cfg or {}).get("servers", [])]
     options = (cfg or {}).get("options", {"allow_unsafe_sql": False})
+    return servers, options
 
-    secrets_servers = load_servers_from_secrets()
-    servers = secrets_servers if secrets_servers else yaml_servers
+def load_config(path: str) -> AppConfig:
+    # 1) Secrets UI
+    s1 = _profiles_from_secrets_ui()
+    # 2) Repo secrets file fallback
+    s2 = _profiles_from_secrets_file() if not s1 else []
+    # 3) YAML (last resort)
+    y_servers, y_opts = _profiles_from_yaml(path)
 
-    # --- Diagnostics: record where profiles came from ---
-    st.session_state["profiles_source"] = "secrets" if secrets_servers else "yaml"
-    st.session_state["profiles_from_secrets"] = [s.name for s in secrets_servers]
-    st.session_state["profiles_from_yaml"] = [s.name for s in yaml_servers]
+    if s1:
+        source = "secrets-ui"
+        servers = s1
+        options = y_opts
+    elif s2:
+        source = "secrets-file"
+        servers = s2
+        options = y_opts
+    else:
+        source = "yaml"
+        servers = y_servers
+        options = y_opts
+
+    # Diagnostics (safe: names only)
+    st.session_state["profiles_source"] = source
+    st.session_state["profiles_from_secrets_ui"] = [s.name for s in s1]
+    st.session_state["profiles_from_secrets_file"] = [s.name for s in s2]
+    st.session_state["profiles_from_yaml"] = [s.name for s in y_servers]
 
     return AppConfig(servers=servers, options=options)
 
@@ -343,27 +416,28 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[E
     st.sidebar.title("Helix Commercial Analyzer")
     st.sidebar.caption("Select your server and options")
     if not config.servers:
-        st.sidebar.warning("No servers configured (add Secrets).")
+        st.sidebar.warning("No servers configured (add Secrets or .streamlit/secrets.toml).")
     names = [s.name for s in config.servers] or ["Demo (no DB)"]
     choice = st.sidebar.selectbox("Server profile", names, index=0)
     profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
     allow_unsafe_default = bool(config.options.get("allow_unsafe_sql", False))
     st.session_state["allow_unsafe_sql"] = st.sidebar.toggle("Allow unsafe SQL (non-SELECT)", value=allow_unsafe_default)
 
-    # ---- Connection Status panel ----
+    # ---- Connection Status + Diagnostics ----
     st.sidebar.markdown("---")
     st.sidebar.subheader("Connection status")
     st.sidebar.caption(f"DBAPI: **{DBAPI}**")
 
-    # Diagnostics: which source provided profiles
     src = st.session_state.get("profiles_source")
     st.sidebar.caption(f"Profiles source: **{src}**")
-    with st.sidebar.expander("Profiles from Secrets"):
-        st.write(", ".join(st.session_state.get("profiles_from_secrets", [])) or "—")
+    with st.sidebar.expander("Profiles from Secrets UI"):
+        st.write(", ".join(st.session_state.get("profiles_from_secrets_ui", [])) or "—")
+    with st.sidebar.expander("Profiles from Secrets FILE"):
+        st.write(", ".join(st.session_state.get("profiles_from_secrets_file", [])) or "—")
     with st.sidebar.expander("Profiles from YAML"):
         st.write(", ".join(st.session_state.get("profiles_from_yaml", [])) or "—")
 
-    # Field presence for current profile (safe; no values)
+    # show field presence (safe; no values)
     st.sidebar.write(
         "Fields present — "
         f"Host: {'✅' if profile.host else '—'} · "
@@ -493,6 +567,18 @@ def section_dashboard(profile: ServerProfile):
             df = dataset_from_sql_or_demo(profile, t.dataset_sql)
             render_chart(apply_filters(df, t.filters), t)
 
+# -------------------------- KPIs --------------------------
+
+def kpi_rail(df: pd.DataFrame):
+    st.header("KPIs")
+    avg_tce = df["tce_usd_day"].mean() if "tce_usd_day" in df else np.nan
+    util = df["utilization"].mean() if "utilization" in df else np.nan
+    dem = df["demurrage_usd"].sum() if "demurrage_usd" in df else np.nan
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Avg TCE (USD/day)", f"{avg_tce:,.0f}" if pd.notna(avg_tce) else "—")
+    c2.metric("Fleet Utilization", f"{util*100:,.1f}%" if pd.notna(util) else "—")
+    c3.metric("Total Demurrage (USD)", f"{dem:,.0f}" if pd.notna(dem) else "—")
+
 # -------------------------- Main --------------------------
 
 def main():
@@ -547,16 +633,6 @@ def main():
     kpi_rail(df)
     section_chart_builder(df)
     section_dashboard(profile)
-
-def kpi_rail(df: pd.DataFrame):
-    st.header("KPIs")
-    avg_tce = df["tce_usd_day"].mean() if "tce_usd_day" in df else np.nan
-    util = df["utilization"].mean() if "utilization" in df else np.nan
-    dem = df["demurrage_usd"].sum() if "demurrage_usd" in df else np.nan
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Avg TCE (USD/day)", f"{avg_tce:,.0f}" if pd.notna(avg_tce) else "—")
-    c2.metric("Fleet Utilization", f"{util*100:,.1f}%" if pd.notna(util) else "—")
-    c3.metric("Total Demurrage (USD)", f"{dem:,.0f}" if pd.notna(dem) else "—")
 
 if __name__ == "__main__":
     main()
