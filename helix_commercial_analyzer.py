@@ -1,19 +1,25 @@
 """
 Helix Commercial Analyzer — Streamlit MVP
-(with Synapse profiles, Secrets support, and Cloud-friendly DBAPI)
+(with Synapse profiles, Secrets support, Cloud-friendly DBAPI, COMM/VW picker, and per-server caching)
 
-This app lets you:
-- Pick a server profile (Azure Synapse / SQL) from config or Streamlit Secrets
-- Run SELECT queries (safe by default)
-- Build charts and a multi-tile dashboard
-- Save/load dashboard JSON
+What you get
+------------
+- Server selector (Azure Synapse/SQL) from YAML or Streamlit Secrets
+- COMM/VW object picker (tables, external tables, views) with filter + preview
+- Query runner (SELECT-only by default) with demo fallback
+- Chart Builder (line/bar/area/scatter/pie/table) + filters
+- Dashboard composer (tiles) + save/load JSON
+- KPI rail (LNG-flavoured demo metrics)
 
 Cloud vs Local
+--------------
 - Local: default DBAPI = pyodbc (needs Microsoft ODBC Driver 18)
-- Cloud (Streamlit Community Cloud): set HELIX_DBAPI=pytds and add creds via Secrets; requirements.txt should use python-tds
+- Cloud (Streamlit Community Cloud): set HELIX_DBAPI=pytds and add creds via Secrets;
+  requirements.txt should include python-tds
 """
 
 from __future__ import annotations
+
 import json
 import os
 from dataclasses import dataclass
@@ -26,20 +32,27 @@ import plotly.express as px
 from pydantic import BaseModel, Field, validator
 from urllib.parse import quote_plus
 
+import sqlalchemy as sa
+from sqlalchemy.engine import Engine
+
+# Optional YAML support (not required on Cloud if using Secrets only)
 try:
     import yaml
 except Exception:
     yaml = None
 
+# Core SQLAlchemy bits
 try:
     from sqlalchemy import create_engine, text
 except Exception:
     create_engine = None
     text = None
 
+
 # ---------------------------
 # Config & Connection Profiles
 # ---------------------------
+
 # NOTE: For security, leave username/password blank here. Use Streamlit Secrets in Cloud.
 DEFAULT_CONFIG_YAML = """
 servers:
@@ -100,6 +113,7 @@ options:
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
 DBAPI = os.getenv("HELIX_DBAPI", "pyodbc").lower()  # set to "pytds" on Streamlit Cloud
 
+
 @dataclass
 class ServerProfile:
     name: str
@@ -110,6 +124,7 @@ class ServerProfile:
     password: Optional[str] = None
     driver: str = "ODBC Driver 18 for SQL Server"
 
+
 @dataclass
 class AppConfig:
     servers: List[ServerProfile]
@@ -117,13 +132,16 @@ class AppConfig:
 
 
 def load_servers_from_secrets() -> List[ServerProfile]:
-    """Read server profiles from Streamlit Secrets if present.
-    Expected shape:
+    """
+    Read server profiles from Streamlit Secrets if present.
+    Expected shape in Secrets:
     [servers.<NAME>]
     host = "..."
     database = "..."
     username = "..."
     password = "..."
+    type = "synapse" (optional)
+    driver = "ODBC Driver 18 for SQL Server" (optional)
     """
     try:
         sec = st.secrets.get("servers", {})
@@ -132,30 +150,33 @@ def load_servers_from_secrets() -> List[ServerProfile]:
     servers: List[ServerProfile] = []
     if isinstance(sec, dict):
         for name, cfg in sec.items():
-            servers.append(ServerProfile(
-                name=name,
-                type=cfg.get("type", "synapse"),
-                host=cfg.get("host", ""),
-                database=cfg.get("database", ""),
-                username=cfg.get("username", ""),
-                password=cfg.get("password", ""),
-                driver=cfg.get("driver", "ODBC Driver 18 for SQL Server"),
-            ))
+            servers.append(
+                ServerProfile(
+                    name=name,
+                    type=cfg.get("type", "synapse"),
+                    host=cfg.get("host", ""),
+                    database=cfg.get("database", ""),
+                    username=cfg.get("username", ""),
+                    password=cfg.get("password", ""),
+                    driver=cfg.get("driver", "ODBC Driver 18 for SQL Server"),
+                )
+            )
     return servers
 
 
 def load_config(path: str) -> AppConfig:
+    # Try YAML config (local dev) unless missing; on Cloud we typically rely on Secrets
     cfg = None
-    if yaml is None:
-        # If PyYAML missing, just rely on Secrets or defaults
-        cfg = json.loads(json.dumps({}))
-    else:
+    if yaml is not None:
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(DEFAULT_CONFIG_YAML)
             st.info(f"No config found. Created example at {path}.")
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+        except Exception:
+            cfg = None
 
     yaml_servers = [ServerProfile(**s) for s in (cfg or {}).get("servers", [])]
     options = (cfg or {}).get("options", {"allow_unsafe_sql": False})
@@ -169,26 +190,27 @@ def load_config(path: str) -> AppConfig:
 # SQL Connectivity Utilities
 # ---------------------------
 
-from sqlalchemy.engine import Engine
-
 def get_sqlalchemy_url(profile: ServerProfile) -> str:
+    """
+    Build a SQLAlchemy URL for the chosen DBAPI and profile.
+    - pytds: pure-Python (good for Streamlit Cloud), requires python-tds
+    - pyodbc: needs Microsoft ODBC Driver 18 installed (local dev)
+    """
     user = (profile.username or "").strip()
-    pwd  = (profile.password or "").strip()
+    pwd = (profile.password or "").strip()
     host = (profile.host or "").strip()
-    db   = (profile.database or "").strip()
+    db = (profile.database or "").strip()
     if not (host and db):
         return ""
 
     if DBAPI == "pytds":
-        # Pure-Python driver for Cloud (no ODBC dependency)
-        # encrypt=yes is default for Synapse; specify port 1433
+        # Cloud: require explicit username/password
         if not (user and pwd):
             return ""
         return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}?encrypt=yes"
     else:
-        # Local: pyodbc via ODBC Driver 18
+        # Local: pyodbc via DSN-less connection string
         if not (user and pwd):
-            # allow demo mode if no creds locally
             return ""
         driver = profile.driver or "ODBC Driver 18 for SQL Server"
         params = (
@@ -199,7 +221,30 @@ def get_sqlalchemy_url(profile: ServerProfile) -> str:
         return f"mssql+pyodbc:///?odbc_connect={quote_plus(params)}"
 
 
+def connection_key(profile: ServerProfile) -> str:
+    """Unique key for cache/session when the user switches server profiles."""
+    return f"{profile.name}|{profile.host}|{profile.database}|{DBAPI}"
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine_for_url(url: str) -> Optional[Engine]:
+    """Cache one SQLAlchemy Engine per distinct URL (server/db/api)."""
+    if create_engine is None or not url:
+        return None
+    return create_engine(url)
+
+
 @st.cache_data(show_spinner=False)
+def run_sql_cached(url: str, sql: str, params: Optional[Dict[str, Any]], limit: int) -> pd.DataFrame:
+    """Cached DB query keyed by URL+SQL so different servers don't collide."""
+    engine: Engine = create_engine(url)
+    with engine.begin() as conn:
+        df = pd.read_sql(text(sql), conn, params=params)
+    if len(df) > limit:
+        df = df.head(limit)
+    return df
+
+
 def run_sql(profile: ServerProfile, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
     if create_engine is None:
         st.error("SQLAlchemy not installed. `pip install sqlalchemy`.")
@@ -214,12 +259,96 @@ def run_sql(profile: ServerProfile, sql: str, params: Optional[Dict[str, Any]] =
         st.warning("No database credentials detected for selected profile. Falling back to demo data.")
         return demo_dataset()
 
-    engine: Engine = create_engine(url)
-    with engine.begin() as conn:
-        df = pd.read_sql(text(sql), conn, params=params)
-    if len(df) > limit:
-        df = df.head(limit)
-    return df
+    return run_sql_cached(url, sql, params, limit)
+
+
+# ---------------------------
+# COMM/VW object listing + preview
+# ---------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_comm_vw_objects(engine: Engine) -> pd.DataFrame:
+    """
+    Return schema + name + type for objects whose names match:
+    - comm% (excluding commercial%)
+    - vw%
+    Works on SQL Server / Synapse: UNION of sys.tables, sys.external_tables, and sys.views.
+    Falls back to information_schema for other dialects.
+    """
+    if engine is None:
+        return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
+
+    dialect = engine.dialect.name.lower()
+    with engine.connect() as conn:
+        if dialect == "mssql":
+            sql = sa.text("""
+                -- Base user tables
+                SELECT s.name AS schema_name,
+                       t.name AS object_name,
+                       'BASE TABLE' AS object_type
+                FROM sys.tables t
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                WHERE (LOWER(t.name) LIKE 'comm%' AND LOWER(t.name) NOT LIKE 'commercial%')
+                   OR LOWER(t.name) LIKE 'vw%'
+
+                UNION ALL
+
+                -- External tables (Synapse / PolyBase)
+                SELECT s.name AS schema_name,
+                       et.name AS object_name,
+                       'EXTERNAL TABLE' AS object_type
+                FROM sys.external_tables et
+                JOIN sys.schemas s ON s.schema_id = et.schema_id
+                WHERE (LOWER(et.name) LIKE 'comm%' AND LOWER(et.name) NOT LIKE 'commercial%')
+                   OR LOWER(et.name) LIKE 'vw%'
+
+                UNION ALL
+
+                -- Views
+                SELECT s.name AS schema_name,
+                       v.name AS object_name,
+                       'VIEW' AS object_type
+                FROM sys.views v
+                JOIN sys.schemas s ON s.schema_id = v.schema_id
+                WHERE (LOWER(v.name) LIKE 'comm%' AND LOWER(v.name) NOT LIKE 'commercial%')
+                   OR LOWER(v.name) LIKE 'vw%'
+
+                ORDER BY schema_name, object_name;
+            """)
+            return pd.read_sql(sql, conn)
+
+        # Generic fallback
+        sql = sa.text("""
+            SELECT table_schema AS schema_name,
+                   table_name   AS object_name,
+                   table_type   AS object_type
+            FROM information_schema.tables
+            WHERE table_type IN ('BASE TABLE','VIEW','EXTERNAL TABLE')
+              AND (
+                    (LOWER(table_name) LIKE 'comm%' AND LOWER(table_name) NOT LIKE 'commercial%')
+                    OR LOWER(table_name) LIKE 'vw%'
+                  )
+            ORDER BY table_schema, table_name;
+        """)
+        return pd.read_sql(sql, conn)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def preview_object(engine: Engine, schema_name: str, object_name: str, limit: int) -> pd.DataFrame:
+    """
+    Load a small preview from the chosen table/view.
+    """
+    if engine is None:
+        return pd.DataFrame()
+    dialect = engine.dialect.name.lower()
+    with engine.connect() as conn:
+        if dialect == "mssql":
+            sql = sa.text(f"SELECT TOP {int(limit)} * FROM [{schema_name}].[{object_name}]")
+        else:
+            prep = sa.sql.compiler.IdentifierPreparer(engine.dialect)
+            fq = f"{prep.quote_identifier(schema_name)}.{prep.quote_identifier(object_name)}"
+            sql = sa.text(f"SELECT * FROM {fq} LIMIT {int(limit)}")
+        return pd.read_sql(sql, conn)
 
 
 # ---------------------------
@@ -370,7 +499,12 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool]:
     st.sidebar.write("**Save / Load dashboard**")
     dl_spec = st.session_state.get("dashboard_spec")
     if dl_spec:
-        st.sidebar.download_button("Download dashboard JSON", data=json.dumps(dl_spec, indent=2), file_name=f"{dl_spec['title']}.json", mime="application/json")
+        st.sidebar.download_button(
+            "Download dashboard JSON",
+            data=json.dumps(dl_spec, indent=2),
+            file_name=f"{dl_spec['title']}.json",
+            mime="application/json",
+        )
     uploaded = st.sidebar.file_uploader("Load dashboard JSON", type=["json"], accept_multiple_files=False)
     if uploaded is not None:
         try:
@@ -393,7 +527,7 @@ def section_query(profile: ServerProfile):
     st.caption("Run a SELECT query or use the demo dataset if not connected.")
     default_sql = st.session_state.get("last_sql", "SELECT TOP 100 * FROM sys.tables")
     sql = st.text_area("SQL (SELECT-only by default)", value=default_sql, height=140)
-    cols = st.columns([1,1,1,2])
+    cols = st.columns([1, 1, 1, 2])
     with cols[0]:
         limit = st.number_input("Row limit", 1000, 500000, 50000, step=1000)
     with cols[1]:
@@ -425,9 +559,9 @@ def section_chart_builder(df: pd.DataFrame) -> TileSpec:
     title = st.text_input("Tile title", value="My Chart")
     chart_type = st.selectbox("Chart type", ["line", "bar", "area", "scatter", "pie", "table"], index=0)
 
-    x = st.selectbox("X axis (or None)", [None] + cols, index=(cols.index("date")+1) if "date" in cols else 0)
-    y = st.selectbox("Y (metric; for pie = values)", [None] + numeric_cols, index=(numeric_cols.index("tce_usd_day")+1) if "tce_usd_day" in numeric_cols else 0)
-    group = st.selectbox("Group / series (optional; for pie = names)", [None] + cols, index=(cols.index("vessel")+1) if "vessel" in cols else 0)
+    x = st.selectbox("X axis (or None)", [None] + cols, index=(cols.index("date") + 1) if "date" in cols else 0)
+    y = st.selectbox("Y (metric; for pie = values)", [None] + numeric_cols, index=(numeric_cols.index("tce_usd_day") + 1) if "tce_usd_day" in numeric_cols else 0)
+    group = st.selectbox("Group / series (optional; for pie = names)", [None] + cols, index=(cols.index("vessel") + 1) if "vessel" in cols else 0)
     agg = st.selectbox("Aggregation", ["sum", "mean", "min", "max", "count"], index=0)
 
     st.subheader("Filters")
@@ -524,6 +658,75 @@ def main():
     config = load_config(CONFIG_PATH)
     profile, _ = sidebar_controls(config)
 
+    # Detect server change and reset editor/data so we don't see stale results
+    cur_key = connection_key(profile)
+    prev_key = st.session_state.get("active_profile_key")
+    if prev_key != cur_key:
+        st.session_state["active_profile_key"] = cur_key
+        # Clear last results so UI reflects the newly selected server
+        st.session_state.pop("last_df", None)
+        st.session_state.pop("last_sql", None)
+        # Clear cached query results keyed to old URLs
+        st.cache_data.clear()
+
+    # Build a reusable Engine for metadata + previews (per-URL)
+    url = get_sqlalchemy_url(profile)
+    engine = get_engine_for_url(url)
+
+    # --- COMM & VW object picker (tables + views) ---
+    st.sidebar.subheader("Choose COMM/VW table/view")
+
+    objects_df = list_comm_vw_objects(engine)
+    schema_name = object_name = object_type = None
+
+    if objects_df.empty:
+        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw*.")
+    else:
+        # Optional quick filter
+        q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
+        if q:
+            filtered = objects_df[
+                objects_df["schema_name"].str.lower().str.contains(q)
+                | objects_df["object_name"].str.lower().str.contains(q)
+            ]
+        else:
+            filtered = objects_df
+
+        if filtered.empty:
+            st.sidebar.info("No matches for current filter.")
+        else:
+            def _label(row):
+                return f"{row['schema_name']}.{row['object_name']}  •  {row['object_type']}"
+            options = [_label(r) for _, r in filtered.iterrows()]
+            chosen = st.sidebar.selectbox("Table/View", options, index=0)
+
+            # Resolve selection
+            sel_idx = options.index(chosen)
+            sel = filtered.iloc[sel_idx]
+            schema_name = sel["schema_name"]
+            object_name = sel["object_name"]
+            object_type = sel["object_type"]
+
+            st.sidebar.caption(f"Selected: `{schema_name}.{object_name}`")
+
+            # Preview + Use in Query
+            preview_limit = st.sidebar.number_input("Preview rows", 10, 2000, 200, step=10)
+            colA, colB = st.sidebar.columns(2)
+            with colA:
+                if st.button("Preview", use_container_width=True):
+                    df_preview = preview_object(engine, schema_name, object_name, int(preview_limit))
+                    st.dataframe(df_preview, use_container_width=True)
+            with colB:
+                if st.button("Use in Query", use_container_width=True):
+                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{schema_name}].[{object_name}]"
+                    try:
+                        df_quick = preview_object(engine, schema_name, object_name, 1000)
+                        st.session_state["last_df"] = df_quick
+                        st.success("Query editor updated from selection.")
+                    except Exception as e:
+                        st.warning(f"Could not load preview: {e}")
+
+    # Existing workflow
     df = section_query(profile)
     kpi_rail(df)
     section_chart_builder(df)
