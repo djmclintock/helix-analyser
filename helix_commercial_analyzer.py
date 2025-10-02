@@ -1,13 +1,9 @@
 """
-Helix Commercial Analyzer — Streamlit MVP
-- COMM/VW picker with preview + “Use in Query”
-- NEW: Auto-sync selected table into main view (toggle)
-- DB dropdown + master fallback for Synapse
-- Per-DB caching keyed by URL
-- Plotly uses config=
-- Pydantic v2 (@field_validator)
-- TLS for pytds via connect_args (cafile/validate_host)
-- Profiles from Secrets UI (preferred), .streamlit/secrets.toml (fallback), or helix_config.yaml
+Helix Commercial Analyzer — Lean Viewer
+- LEFT: server + DB + COMM/VW picker (with preview)
+- RIGHT: data viewer with global search + filters (no SQL editor, no chart builder)
+- Dashboard renderer (read-only) — load JSON from sidebar
+- Synapse-friendly: auto-fallback to master, DB dropdown, TLS for pytds via connect_args
 """
 
 from __future__ import annotations
@@ -25,16 +21,15 @@ from urllib.parse import quote_plus
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+import certifi  # TLS CA bundle (pytds)
 
-import certifi  # TLS CA bundle for pytds
-
-# Optional YAML
+# Optional YAML for local fallback config
 try:
     import yaml
 except Exception:
     yaml = None
 
-# TOML parser for repo fallback secrets
+# TOML parser to read repo-side secrets if present
 try:
     import tomllib  # Py 3.11+
 except Exception:
@@ -51,10 +46,11 @@ except Exception:
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
 
 def _get_dbapi() -> str:
+    # Prefer Secrets UI; then env var; default pyodbc
     try:
-        sec_val = st.secrets.get("HELIX_DBAPI", None)
-        if isinstance(sec_val, str) and sec_val.strip():
-            return sec_val.strip().lower()
+        val = st.secrets.get("HELIX_DBAPI", None)
+        if isinstance(val, str) and val.strip():
+            return val.strip().lower()
     except Exception:
         pass
     return os.getenv("HELIX_DBAPI", "pyodbc").lower()
@@ -91,7 +87,29 @@ class AppConfig:
     servers: List[ServerProfile]
     options: Dict[str, Any]
 
-# -------------------------- Load profiles --------------------------
+class TileSpec(BaseModel):
+    title: str = Field(...)
+    chart_type: str = Field("line")
+    dataset_sql: Optional[str] = None
+    x: Optional[str] = None
+    y: Optional[str] = None
+    group: Optional[str] = None
+    agg: Optional[str] = Field("sum")
+    filters: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("chart_type")
+    @classmethod
+    def _check_chart(cls, v: str) -> str:
+        allowed = {"line","bar","area","scatter","pie","table"}
+        if v not in allowed:
+            raise ValueError(f"chart_type must be one of {allowed}")
+        return v
+
+class DashboardSpec(BaseModel):
+    title: str
+    tiles: List[TileSpec] = Field(default_factory=list)
+
+# -------------------------- Profile loading --------------------------
 
 def _profiles_from_secrets_ui() -> List[ServerProfile]:
     try:
@@ -170,7 +188,6 @@ def load_config(path: str) -> AppConfig:
     st.session_state["profiles_from_secrets_ui"] = [s.name for s in s1]
     st.session_state["profiles_from_secrets_file"] = [s.name for s in s2]
     st.session_state["profiles_from_yaml"] = [s.name for s in y_servers]
-
     return AppConfig(servers=servers, options=options)
 
 # -------------------------- Connectivity --------------------------
@@ -185,7 +202,6 @@ def build_url(p: ServerProfile, db_override: Optional[str] = None) -> str:
     if DBAPI == "pytds":
         if not (user and pwd):
             return ""
-        # TLS via connect_args (cafile enables encryption)
         return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}"
     else:
         if not (user and pwd):
@@ -233,19 +249,7 @@ def run_sql_cached(url: str, sql: str, params: Optional[Dict[str, Any]], limit: 
         df = pd.read_sql(text(sql), conn, params=params)
     return df.head(limit) if len(df) > limit else df
 
-def run_sql(url: str, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
-    if create_engine is None:
-        st.error("SQLAlchemy missing. Install dependencies.")
-        return pd.DataFrame()
-    if not sql.strip().lower().startswith("select") and not st.session_state.get("allow_unsafe_sql", False):
-        st.error("Only SELECT statements are allowed.")
-        return pd.DataFrame()
-    if not url:
-        st.warning("No database credentials detected for selected profile. Using demo data.")
-        return demo_dataset()
-    return run_sql_cached(url, sql, params, limit)
-
-# -------------------------- DB discovery & object listing --------------------------
+# -------------------------- Discovery + object APIs (URL-keyed caches) --------------------------
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_databases(url: str) -> List[str]:
@@ -256,8 +260,7 @@ def list_databases(url: str) -> List[str]:
         return []
     try:
         with engine.connect() as conn:
-            q = sa.text("SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name;")
-            rows = conn.execute(q).fetchall()
+            rows = conn.execute(sa.text("SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name;")).fetchall()
             return [r[0] for r in rows]
     except Exception:
         return []
@@ -304,7 +307,7 @@ def list_comm_vw_objects(url: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
 
 @st.cache_data(ttl=120, show_spinner=False)
-def preview_object(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
+def fetch_table_sample(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
     if not url:
         return pd.DataFrame()
     engine = get_engine_for_url(url)
@@ -318,80 +321,194 @@ def preview_object(url: str, schema: str, name: str, limit: int) -> pd.DataFrame
             prep = sa.sql.compiler.IdentifierPreparer(engine.dialect)
             fq = f"{prep.quote_identifier(schema)}.{prep.quote_identifier(name)}"
             sql = sa.text(f"SELECT * FROM {fq} LIMIT {int(limit)}")
-        return pd.read_sql(sql, conn)
+        df = pd.read_sql(sql, conn)
+    # Best-effort: parse datetimes
+    for c in df.columns:
+        if df[c].dtype == object:
+            try:
+                df[c] = pd.to_datetime(df[c], errors="ignore", utc=False)
+            except Exception:
+                pass
+    return df
 
-# -------------------------- Demo data --------------------------
+# -------------------------- Demo dataset --------------------------
 
 def demo_dataset() -> pd.DataFrame:
     np.random.seed(7)
-    dates = pd.date_range("2024-01-01", periods=120, freq="D")
-    vessels = ["LNG Aurora", "LNG Borealis", "LNG Caledonia", "LNG Dorado"]
-    trades = ["Spot", "Time Charter", "COA"]
-    ports = ["Ras Laffan", "Zeebrugge", "Gate", "South Hook", "Sines", "Montoir"]
-    rows = []
-    for d in dates:
-        for v in vessels:
-            rows.append({
-                "date": d, "vessel": v,
-                "trade_type": np.random.choice(trades, p=[0.5, 0.3, 0.2]),
-                "load_port": np.random.choice(ports),
-                "discharge_port": np.random.choice(ports),
-                "tce_usd_day": np.random.normal(95000, 15000),
-                "utilization": np.clip(np.random.normal(0.85, 0.08), 0, 1),
-                "demurrage_usd": max(0, np.random.normal(20000, 40000)),
-                "cargo_mmbtu": np.random.normal(3300, 300),
-            })
-    df = pd.DataFrame(rows)
-    df["month"] = df["date"].dt.to_period("M").astype(str)
-    return df
+    dates = pd.date_range("2024-01-01", periods=30, freq="D")
+    rows = [{"date": d, "category": np.random.choice(["A","B","C"]), "value": np.random.randint(1, 100)} for d in dates]
+    return pd.DataFrame(rows)
 
-# -------------------------- Dashboard models --------------------------
+# -------------------------- UI helpers (filters + search) --------------------------
 
-class TileSpec(BaseModel):
-    title: str = Field(...)
-    chart_type: str = Field("line")
-    dataset_sql: Optional[str] = None
-    x: Optional[str] = None
-    y: Optional[str] = None
-    group: Optional[str] = None
-    agg: Optional[str] = Field("sum")
-    filters: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("chart_type")
-    @classmethod
-    def _check_chart(cls, v: str) -> str:
-        allowed = {"line","bar","area","scatter","pie","table"}
-        if v not in allowed:
-            raise ValueError(f"chart_type must be one of {allowed}")
-        return v
-
-class DashboardSpec(BaseModel):
-    title: str
-    tiles: List[TileSpec] = Field(default_factory=list)
-
-# -------------------------- UI helpers --------------------------
-
-def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
-    out = df.copy()
-    for col, val in filters.items():
-        if col not in out.columns:
+def apply_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    if not query:
+        return df
+    q = str(query).strip().lower()
+    if not q:
+        return df
+    # string-match across all columns (safe stringify)
+    mask = pd.Series(False, index=df.index)
+    for c in df.columns:
+        try:
+            col_as_str = df[c].astype(str).str.lower()
+            mask |= col_as_str.str.contains(q, na=False)
+        except Exception:
             continue
-        if isinstance(val, (list, tuple, set)):
-            out = out[out[col].isin(list(val))]
-        elif isinstance(val, dict) and {"start","end"} <= set(val.keys()):
-            start = pd.to_datetime(val.get("start")) if val.get("start") else None
-            end = pd.to_datetime(val.get("end")) if val.get("end") else None
-            if start is not None: out = out[out[col] >= start]
-            if end   is not None: out = out[out[col] <= end]
-        else:
-            out = out[out[col] == val]
+    return df[mask]
+
+def apply_filters(df: pd.DataFrame, dt_cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    with st.expander("Filters", expanded=False):
+        # Date range filters (per datetime column)
+        if dt_cols:
+            for dc in dt_cols:
+                st.caption(f"Date filter — {dc}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    start = st.date_input(f"Start ({dc})", value=None, format="YYYY-MM-DD", key=f"start_{dc}")
+                with col2:
+                    end = st.date_input(f"End ({dc})", value=None, format="YYYY-MM-DD", key=f"end_{dc}")
+                if start is not None:
+                    out = out[out[dc] >= pd.to_datetime(start)]
+                if end is not None:
+                    out = out[out[dc] <= pd.to_datetime(end)]
+
+        # Categorical quick filters (top 8 distinct values per column)
+        cat_cols = [c for c in out.columns if out[c].dtype == "object" or pd.api.types.is_categorical_dtype(out[c])]
+        if cat_cols:
+            st.caption("Categorical filters")
+            for c in cat_cols[:12]:
+                vals = out[c].dropna().astype(str).unique().tolist()
+                vals = sorted(vals)[:200]
+                choice = st.multiselect(c, vals, key=f"cat_{c}")
+                if choice:
+                    out = out[out[c].astype(str).isin(choice)]
     return out
+
+# -------------------------- Sidebar (server/DB/table) --------------------------
+
+def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Optional[Dict[str, str]]]:
+    st.sidebar.title("Helix Commercial Analyzer")
+    st.sidebar.caption("Select your server and source table")
+
+    if not config.servers:
+        st.sidebar.warning("No servers configured (add Secrets or .streamlit/secrets.toml).")
+
+    names = [s.name for s in config.servers] or ["Demo (no DB)"]
+    choice = st.sidebar.selectbox("Server profile", names, index=0)
+    base_profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
+
+    # Diagnostics
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Connection status")
+    st.sidebar.caption(f"DBAPI: **{DBAPI}**")
+    st.sidebar.caption(f"Profiles source: **{st.session_state.get('profiles_source')}**")
+    with st.sidebar.expander("Profiles from Secrets UI"):
+        st.write(", ".join(st.session_state.get("profiles_from_secrets_ui", [])) or "—")
+    with st.sidebar.expander("Profiles from Secrets FILE"):
+        st.write(", ".join(st.session_state.get("profiles_from_secrets_file", [])) or "—")
+    with st.sidebar.expander("Profiles from YAML"):
+        st.write(", ".join(st.session_state.get("profiles_from_yaml", [])) or "—")
+
+    st.sidebar.write(
+        "Fields — "
+        f"Host: {'✅' if base_profile.host else '—'} · "
+        f"DB: {'✅' if base_profile.database else '—'} · "
+        f"User: {'✅' if base_profile.username else '—'} · "
+        f"Pwd: {'✅' if base_profile.password else '—'}"
+    )
+
+    # Try configured DB; if it fails ("Cannot open database"), fall back to master to enumerate DBs
+    configured_url = build_url(base_profile, None)
+    ok, err = try_connect(configured_url)
+    effective_db = base_profile.database
+    effective_url = configured_url
+    if not ok and ("Cannot open database" in err or "Login failed" in err):
+        master_url = build_url(base_profile, "master")
+        ok2, err2 = try_connect(master_url)
+        if ok2:
+            effective_db = "master"
+            effective_url = master_url
+            st.sidebar.info("Connected to **master** to discover databases (configured DB not accessible).")
+        else:
+            st.sidebar.info("Not connected")
+            st.sidebar.code(err or err2)
+
+    st.sidebar.write(f"Credentials present: **{'Yes' if bool(configured_url) else 'No'}**")
+    if DBAPI == "pytds" and (configured_url or effective_url):
+        st.sidebar.caption(f"TLS (pytds) CA: `{certifi.where()}`")
+
+    if effective_url:
+        st.sidebar.success("Connected")
+
+    # Database dropdown
+    dbs = list_databases(effective_url) if effective_url else []
+    initial = effective_db if effective_db in dbs else (dbs[0] if dbs else effective_db or "master")
+    selected_db = st.sidebar.selectbox("Database", dbs or [initial], index=(dbs.index(initial) if dbs and initial in dbs else 0))
+    effective_url = build_url(base_profile, selected_db)
+    effective_profile = replace(base_profile, database=selected_db)
+
+    # COMM/VW picker
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Choose COMM/VW table/view")
+    objs = list_comm_vw_objects(effective_url)
+    chosen = None
+    if objs.empty:
+        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw* in this DB.")
+    else:
+        q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
+        filt = objs[
+            objs["schema_name"].str.lower().str.contains(q) | objs["object_name"].str.lower().str.contains(q)
+        ] if q else objs
+        if filt.empty:
+            st.sidebar.info("No matches for current filter.")
+        else:
+            labels = [f"{r.schema_name}.{r.object_name}  •  {r.object_type}" for r in filt.itertuples(index=False)]
+            chosen_label = st.sidebar.selectbox("Table/View", labels, index=0, key="object_select")
+            idx = labels.index(chosen_label)
+            chosen = filt.iloc[idx]
+            st.sidebar.caption(f"Selected: `{chosen['schema_name']}.{chosen['object_name']}`")
+            n = st.sidebar.number_input("Preview rows", 10, 50000, 1000, step=50, key="preview_rows")
+            if st.sidebar.button("Refresh sample"):
+                # Force refresh by clearing this key in cache for current URL/object
+                st.cache_data.clear()
+            if chosen is not None:
+                # Auto-load sample to main view
+                st.session_state["last_df"] = fetch_table_sample(effective_url, chosen["schema_name"], chosen["object_name"], int(n))
+                st.session_state["data_source"] = f"{selected_db}.{chosen['schema_name']}.{chosen['object_name']}"
+
+    # Save / Load dashboard JSON (read-only rendering)
+    st.sidebar.markdown("---")
+    st.sidebar.write("**Load dashboard JSON**")
+    up = st.sidebar.file_uploader("Load dashboard JSON", type=["json"])
+    if up is not None:
+        try:
+            spec = json.load(up)
+            DashboardSpec(**spec)  # validate
+            st.session_state["dashboard_spec"] = spec
+            st.sidebar.success("Dashboard loaded.")
+        except Exception as e:
+            st.sidebar.error(f"Invalid JSON: {e}")
+
+    state = {"profile": effective_profile, "url": effective_url, "chosen": chosen}
+    return effective_profile, effective_url, state
+
+# -------------------------- Dashboard rendering (read-only) --------------------------
 
 def aggregate(df: pd.DataFrame, x: Optional[str], y: Optional[str], group: Optional[str], agg: str) -> pd.DataFrame:
     if y is None: return df
     aggfunc = {"sum":"sum","mean":"mean","min":"min","max":"max","count":"count"}.get(agg,"sum")
     keys = [c for c in [x, group] if c]
     return df.groupby(keys, dropna=False)[y].agg(aggfunc).reset_index() if keys else df[[y]].agg(aggfunc).to_frame().T
+
+def dataset_for_tile(url: str, t: TileSpec, fallback_df: pd.DataFrame) -> pd.DataFrame:
+    if t.dataset_sql and url:
+        try:
+            return run_sql_cached(url, t.dataset_sql, None, 200000)
+        except Exception as e:
+            st.warning(f"Tile '{t.title}' failed to load SQL dataset; using main table. ({str(e)[:140]})")
+    return fallback_df
 
 def render_chart(df: pd.DataFrame, spec: TileSpec):
     cfg = {"responsive": True, "displaylogo": False}
@@ -418,254 +535,29 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
     fig.update_layout(margin=dict(l=8,r=8,t=48,b=8))
     st.plotly_chart(fig, config=cfg)
 
-# -------------------------- Sections --------------------------
-
-def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Dict[str, Any]]:
-    st.sidebar.title("Helix Commercial Analyzer")
-    st.sidebar.caption("Select your server and options")
-
-    if not config.servers:
-        st.sidebar.warning("No servers configured (add Secrets or .streamlit/secrets.toml).")
-
-    names = [s.name for s in config.servers] or ["Demo (no DB)"]
-    choice = st.sidebar.selectbox("Server profile", names, index=0)
-    base_profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
-
-    # toggles / options
-    allow_unsafe_default = bool(config.options.get("allow_unsafe_sql", False))
-    st.session_state["allow_unsafe_sql"] = st.sidebar.toggle("Allow unsafe SQL (non-SELECT)", value=allow_unsafe_default)
-    auto_sync = st.sidebar.toggle("Auto-sync selected table to main view", value=True, key="auto_sync")
-
-    # Diagnostics
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Connection status")
-    st.sidebar.caption(f"DBAPI: **{DBAPI}**")
-    st.sidebar.caption(f"Profiles source: **{st.session_state.get('profiles_source')}**")
-    with st.sidebar.expander("Profiles from Secrets UI"):
-        st.write(", ".join(st.session_state.get("profiles_from_secrets_ui", [])) or "—")
-    with st.sidebar.expander("Profiles from Secrets FILE"):
-        st.write(", ".join(st.session_state.get("profiles_from_secrets_file", [])) or "—")
-    with st.sidebar.expander("Profiles from YAML"):
-        st.write(", ".join(st.session_state.get("profiles_from_yaml", [])) or "—")
-
-    st.sidebar.write(
-        "Fields present — "
-        f"Host: {'✅' if base_profile.host else '—'} · "
-        f"DB: {'✅' if base_profile.database else '—'} · "
-        f"User: {'✅' if base_profile.username else '—'} · "
-        f"Pwd: {'✅' if base_profile.password else '—'}"
-    )
-
-    # Attempt configured DB; if fails (cannot open DB), connect to master to enumerate DBs
-    configured_url = build_url(base_profile, None)
-    ok, err = try_connect(configured_url)
-    effective_db = base_profile.database
-    effective_url = configured_url
-    fallback_used = False
-
-    if not ok and ("Cannot open database" in err or "Login failed" in err):
-        master_url = build_url(base_profile, "master")
-        ok2, err2 = try_connect(master_url)
-        if ok2:
-            fallback_used = True
-            effective_db = "master"
-            effective_url = master_url
-            st.sidebar.info("Connected to **master** to discover databases (original DB could not be opened).")
-        else:
-            st.sidebar.code(err or err2)
-
-    st.sidebar.write(f"Credentials present: **{'Yes' if bool(configured_url) else 'No'}**")
-    if DBAPI == "pytds" and (configured_url or effective_url):
-        st.sidebar.caption(f"TLS (pytds) CA: `{certifi.where()}`")
-
-    if ok or fallback_used:
-        st.sidebar.success("Connected")
-    else:
-        st.sidebar.info("Not connected")
-        if err:
-            st.sidebar.code(err)
-
-    # DB dropdown
-    db_candidates = list_databases(effective_url) if (ok or fallback_used) else []
-    initial = effective_db if effective_db in db_candidates else (db_candidates[0] if db_candidates else effective_db or "master")
-    selected_db = st.sidebar.selectbox(
-        "Database",
-        db_candidates or [initial],
-        index=(db_candidates.index(initial) if db_candidates and initial in db_candidates else 0),
-        key="db_select"
-    )
-
-    # Build effective URL/profile with selected DB
-    effective_url = build_url(base_profile, selected_db)
-    effective_profile = replace(base_profile, database=selected_db)
-
-    # Object picker
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Choose COMM/VW table/view")
-    objs = list_comm_vw_objects(effective_url)
-    if objs.empty:
-        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw* in this DB.")
-        chosen_label = None
-        chosen = None
-    else:
-        q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
-        filt = objs[
-            objs["schema_name"].str.lower().str.contains(q) | objs["object_name"].str.lower().str.contains(q)
-        ] if q else objs
-        if filt.empty:
-            st.sidebar.info("No matches for current filter.")
-            chosen_label = None
-            chosen = None
-        else:
-            labels = [f"{r.schema_name}.{r.object_name}  •  {r.object_type}" for r in filt.itertuples(index=False)]
-            chosen_label = st.sidebar.selectbox("Table/View", labels, index=0, key="object_select")
-            idx = labels.index(chosen_label)
-            chosen = filt.iloc[idx]
-            st.sidebar.caption(f"Selected: `{chosen['schema_name']}.{chosen['object_name']}`")
-
-            # Buttons
-            n = st.sidebar.number_input("Preview rows", 10, 2000, 200, step=10, key="preview_rows")
-            cA, cB = st.sidebar.columns(2)
-            with cA:
-                if st.button("Preview", key="btn_preview"):
-                    st.dataframe(preview_object(effective_url, chosen["schema_name"], chosen["object_name"], int(n)))
-            with cB:
-                if st.button("Use in Query", key="btn_use_in_query"):
-                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{chosen['schema_name']}].[{chosen['object_name']}]"
-                    try:
-                        st.session_state["last_df"] = preview_object(effective_url, chosen["schema_name"], chosen["object_name"], 1000)
-                        st.session_state["data_source"] = f"{effective_profile.database}.{chosen['schema_name']}.{chosen['object_name']}"
-                        st.success("Main view updated from selection.")
-                    except Exception as e:
-                        st.warning(str(e)[:300])
-
-            # Auto-sync: update main view when selection changes
-            current_sel_key = f"{effective_profile.database}|{chosen['schema_name']}.{chosen['object_name']}"
-            if st.session_state.get("selected_object_key") != current_sel_key:
-                st.session_state["selected_object_key"] = current_sel_key
-                if auto_sync:
-                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{chosen['schema_name']}].[{chosen['object_name']}]"
-                    st.session_state["last_df"] = preview_object(effective_url, chosen["schema_name"], chosen["object_name"], 1000)
-                    st.session_state["data_source"] = f"{effective_profile.database}.{chosen['schema_name']}.{chosen['object_name']}"
-                    st.rerun()
-
-    state = {
-        "profile": effective_profile,
-        "url": effective_url,
-        "chosen": chosen,
-        "auto_sync": auto_sync
-    }
-    return effective_profile, effective_url, state
-
-def section_query(url: str, state: Dict[str, Any]):
-    st.header("Query")
-    ds = st.session_state.get("data_source", "Demo dataset")
-    st.caption(f"Connected DB: **{state['profile'].database}** • Data source: **{ds}**")
-
-    default_sql = st.session_state.get("last_sql", "SELECT TOP 100 * FROM sys.tables")
-    sql = st.text_area("SQL (SELECT-only by default)", value=default_sql, height=140, key="sql_editor")
-    c1, c2, c3, _ = st.columns([1,1,1,2])
-    with c1:
-        limit = st.number_input("Row limit", 1000, 500000, 50000, step=1000, key="row_limit")
-    with c2:
-        run_btn = st.button("Run query", key="btn_run_query")
-    with c3:
-        use_demo = st.toggle("Use demo data", value=False, key="use_demo_toggle")
-
-    if run_btn:
-        st.session_state["last_sql"] = sql
-        if use_demo or not url:
-            df = demo_dataset()
-            st.session_state["data_source"] = "Demo dataset"
-        else:
-            df = run_sql(url, sql, limit=limit)
-            st.session_state["data_source"] = f"{state['profile'].database} (custom SQL)"
-        st.session_state["last_df"] = df
-
-    df = st.session_state.get("last_df", demo_dataset())
-    st.dataframe(df)
-    st.caption(f"Rows in memory: {len(df):,}")
-    return df
-
-def section_chart_builder(df: pd.DataFrame) -> TileSpec:
-    st.header("Chart Builder")
-    cols = df.columns.tolist()
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    dt_cols = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
-
-    title = st.text_input("Tile title", value="My Chart")
-    chart_type = st.selectbox("Chart type", ["line","bar","area","scatter","pie","table"], index=0)
-    x = st.selectbox("X axis (or None)", [None]+cols, index=(cols.index("date")+1) if "date" in cols else 0)
-    y = st.selectbox("Y (metric; for pie = values)", [None]+numeric_cols, index=(numeric_cols.index("tce_usd_day")+1) if "tce_usd_day" in numeric_cols else 0)
-    group = st.selectbox("Group / series (optional; for pie = names)", [None]+cols, index=(cols.index("vessel")+1) if "vessel" in cols else 0)
-    agg = st.selectbox("Aggregation", ["sum","mean","min","max","count"], index=0)
-
-    st.subheader("Filters")
-    filters: Dict[str, Any] = {}
-    with st.expander("Date filter", expanded=False):
-        if dt_cols:
-            dc = st.selectbox("Date column", dt_cols, index=0)
-            start = st.date_input("Start", value=None, format="YYYY-MM-DD")
-            end = st.date_input("End", value=None, format="YYYY-MM-DD")
-            if start: filters[dc] = {"start": str(start)}
-            if end:   filters.setdefault(dc, {}).update({"end": str(end)})
-        else:
-            st.info("No datetime columns detected.")
-    with st.expander("Categorical filters", expanded=False):
-        for c in [c for c in cols if c not in numeric_cols + dt_cols]:
-            vals = sorted([str(v) for v in df[c].dropna().unique().tolist()])
-            if not vals: continue
-            selected = st.multiselect(c, vals)
-            if selected: filters[c] = selected
-
-    add = st.button("Add tile to dashboard")
-    current_sql = st.session_state.get("last_sql")
-    spec = TileSpec(title=title or "Untitled", chart_type=chart_type, dataset_sql=current_sql, x=x, y=y, group=group, agg=agg, filters=filters)
-
-    if add:
-        dash: DashboardSpec = DashboardSpec(**st.session_state.get("dashboard_spec", {"title":"Commercial Dashboard","tiles":[]}))
-        dash.tiles.append(spec)
-        st.session_state["dashboard_spec"] = json.loads(dash.model_dump_json())
-        st.success("Tile added.")
-
-    st.subheader("Preview")
-    render_chart(apply_filters(df, filters), spec)
-    return spec
-
-def section_dashboard(url: str):
+def section_dashboard(url: str, main_df: pd.DataFrame):
     st.header("Dashboard")
-    spec = st.session_state.get("dashboard_spec", {"title":"Commercial Dashboard","tiles":[]})
+    spec = st.session_state.get("dashboard_spec")
+    if not spec:
+        st.info("Load a dashboard JSON from the sidebar to display charts.")
+        return
     dash = DashboardSpec(**spec)
-    st.text_input("Dashboard title", value=dash.title, key="dash_title")
-    dash.title = st.session_state.get("dash_title", dash.title)
+    st.subheader(dash.title)
+    for i, t in enumerate(dash.tiles):
+        st.markdown(f"**{t.title}**")
+        df = dataset_for_tile(url, t, main_df)
+        # Apply per-tile filters (if provided in JSON)
+        # Only a basic equality/membership filter here; extend as needed.
+        if t.filters:
+            for col, val in t.filters.items():
+                if col in df.columns:
+                    if isinstance(val, (list, tuple, set)):
+                        df = df[df[col].isin(list(val))]
+                    else:
+                        df = df[df[col] == val]
+        render_chart(df, t)
 
-    if not dash.tiles:
-        st.info("No tiles yet. Build one above.")
-    else:
-        for i, t in enumerate(dash.tiles):
-            c1, c2 = st.columns(2)
-            with c1: st.subheader(t.title)
-            with c2:
-                if st.button("Delete", key=f"del_{i}"):
-                    dash.tiles.pop(i)
-                    st.session_state["dashboard_spec"] = json.loads(DashboardSpec(title=dash.title, tiles=dash.tiles).model_dump_json())
-                    st.rerun()
-            df = run_sql(url, t.dataset_sql) if (t.dataset_sql and url) else demo_dataset()
-            render_chart(apply_filters(df, t.filters), t)
-
-# -------------------------- KPIs --------------------------
-
-def kpi_rail(df: pd.DataFrame):
-    st.header("KPIs")
-    avg_tce = df["tce_usd_day"].mean() if "tce_usd_day" in df else np.nan
-    util = df["utilization"].mean() if "utilization" in df else np.nan
-    dem = df["demurrage_usd"].sum() if "demurrage_usd" in df else np.nan
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Avg TCE (USD/day)", f"{avg_tce:,.0f}" if pd.notna(avg_tce) else "—")
-    c2.metric("Fleet Utilization", f"{util*100:,.1f}%" if pd.notna(util) else "—")
-    c3.metric("Total Demurrage (USD)", f"{dem:,.0f}" if pd.notna(dem) else "—")
-
-# -------------------------- Main --------------------------
+# -------------------------- Main (lean viewer) --------------------------
 
 def main():
     st.set_page_config(page_title="Helix Commercial Analyzer", layout="wide")
@@ -673,20 +565,33 @@ def main():
     config = load_config(CONFIG_PATH)
     profile, url, state = sidebar_controls(config)
 
-    # Reset state when server / db changes
+    # Reset when server/DB changes
     cur_key = connection_key(profile.name, profile.host, profile.database)
     prev_key = st.session_state.get("active_profile_key")
     if prev_key != cur_key:
         st.session_state["active_profile_key"] = cur_key
         st.session_state.pop("last_df", None)
-        st.session_state.pop("last_sql", None)
         st.session_state["data_source"] = "Demo dataset"
         st.cache_data.clear()
 
-    df = section_query(url, state)
-    kpi_rail(df)
-    section_chart_builder(df)
-    section_dashboard(url)
+    # ---------- DATA VIEW ----------
+    st.header("Data")
+    source_label = st.session_state.get("data_source", "Demo dataset")
+    df = st.session_state.get("last_df", demo_dataset())
+    st.caption(f"Source: **{source_label}** • Rows loaded: **{len(df):,}**")
+
+    # Global search (string contains across all columns)
+    search_q = st.text_input("Search", placeholder="Type to find any text across all columns…", key="global_search")
+    df_filtered = apply_search(df, search_q)
+
+    # Filters (date + categorical)
+    dt_cols = [c for c in df_filtered.columns if pd.api.types.is_datetime64_any_dtype(df_filtered[c])]
+    df_filtered = apply_filters(df_filtered, dt_cols)
+
+    st.dataframe(df_filtered)
+
+    # ---------- DASHBOARD (read-only) ----------
+    section_dashboard(url, df_filtered)
 
 if __name__ == "__main__":
     main()
