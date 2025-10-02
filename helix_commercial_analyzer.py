@@ -1,17 +1,13 @@
 """
 Helix Commercial Analyzer — Streamlit MVP
 - COMM/VW picker with preview + “Use in Query”
-- Per-server caching & server-change reset
-- Plotly: config= usage (no deprecated kwargs)
+- NEW: Auto-sync selected table into main view (toggle)
+- DB dropdown + master fallback for Synapse
+- Per-DB caching keyed by URL
+- Plotly uses config=
 - Pydantic v2 (@field_validator)
-- Connection diagnostics
-- Reads server profiles from:
-    1) Secrets UI (preferred), or
-    2) .streamlit/secrets.toml in the repo (fallback), else
-    3) helix_config.yaml
-- TLS for pytds: pass cafile/validate_host via create_engine(connect_args=...)
-- NEW: Auto-fallback to master if DB open fails, DB dropdown to switch databases,
-       and per-DB connection URLs.
+- TLS for pytds via connect_args (cafile/validate_host)
+- Profiles from Secrets UI (preferred), .streamlit/secrets.toml (fallback), or helix_config.yaml
 """
 
 from __future__ import annotations
@@ -30,16 +26,15 @@ from urllib.parse import quote_plus
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-# TLS CA bundle for pytds
-import certifi
+import certifi  # TLS CA bundle for pytds
 
-# Optional YAML for local dev config
+# Optional YAML
 try:
     import yaml
 except Exception:
     yaml = None
 
-# TOML parser for fallback .streamlit/secrets.toml
+# TOML parser for repo fallback secrets
 try:
     import tomllib  # Py 3.11+
 except Exception:
@@ -56,7 +51,6 @@ except Exception:
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
 
 def _get_dbapi() -> str:
-    # Prefer Secrets UI; then env var; default pyodbc
     try:
         sec_val = st.secrets.get("HELIX_DBAPI", None)
         if isinstance(sec_val, str) and sec_val.strip():
@@ -172,7 +166,6 @@ def load_config(path: str) -> AppConfig:
     else:
         source = "yaml"; servers = y_servers; options = y_opts
 
-    # Diagnostics (safe: names only)
     st.session_state["profiles_source"] = source
     st.session_state["profiles_from_secrets_ui"] = [s.name for s in s1]
     st.session_state["profiles_from_secrets_file"] = [s.name for s in s2]
@@ -180,10 +173,9 @@ def load_config(path: str) -> AppConfig:
 
     return AppConfig(servers=servers, options=options)
 
-# -------------------------- Connectivity helpers --------------------------
+# -------------------------- Connectivity --------------------------
 
 def build_url(p: ServerProfile, db_override: Optional[str] = None) -> str:
-    """Build an SQLAlchemy URL for this profile, optionally overriding the database."""
     user = (p.username or "").strip()
     pwd  = (p.password or "").strip()
     host = (p.host or "").strip()
@@ -193,6 +185,7 @@ def build_url(p: ServerProfile, db_override: Optional[str] = None) -> str:
     if DBAPI == "pytds":
         if not (user and pwd):
             return ""
+        # TLS via connect_args (cafile enables encryption)
         return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}"
     else:
         if not (user and pwd):
@@ -211,7 +204,6 @@ def connection_key(name: str, host: str, db: str) -> str:
 def get_engine_for_url(url: str) -> Optional[Engine]:
     if create_engine is None or not url:
         return None
-    # pytds needs TLS params passed via connect_args (cafile enables encryption)
     if DBAPI == "pytds":
         return create_engine(
             url,
@@ -241,7 +233,7 @@ def run_sql_cached(url: str, sql: str, params: Optional[Dict[str, Any]], limit: 
         df = pd.read_sql(text(sql), conn, params=params)
     return df.head(limit) if len(df) > limit else df
 
-def run_sql(profile: ServerProfile, url: str, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
+def run_sql(url: str, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
     if create_engine is None:
         st.error("SQLAlchemy missing. Install dependencies.")
         return pd.DataFrame()
@@ -257,7 +249,6 @@ def run_sql(profile: ServerProfile, url: str, sql: str, params: Optional[Dict[st
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_databases(url: str) -> List[str]:
-    """List non-system databases from this server."""
     if not url:
         return []
     engine = get_engine_for_url(url)
@@ -380,9 +371,6 @@ class DashboardSpec(BaseModel):
 
 # -------------------------- UI helpers --------------------------
 
-def dataset_from_sql_or_demo(url: str, sql: Optional[str]) -> pd.DataFrame:
-    return run_sql_cached(url, sql, None, 100000) if (sql and sql.strip()) else demo_dataset()
-
 def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     out = df.copy()
     for col, val in filters.items():
@@ -430,27 +418,29 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
     fig.update_layout(margin=dict(l=8,r=8,t=48,b=8))
     st.plotly_chart(fig, config=cfg)
 
-# -------------------------- Sidebar --------------------------
+# -------------------------- Sections --------------------------
 
-def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str]:
+def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Dict[str, Any]]:
     st.sidebar.title("Helix Commercial Analyzer")
     st.sidebar.caption("Select your server and options")
+
     if not config.servers:
         st.sidebar.warning("No servers configured (add Secrets or .streamlit/secrets.toml).")
+
     names = [s.name for s in config.servers] or ["Demo (no DB)"]
     choice = st.sidebar.selectbox("Server profile", names, index=0)
     base_profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
 
+    # toggles / options
     allow_unsafe_default = bool(config.options.get("allow_unsafe_sql", False))
     st.session_state["allow_unsafe_sql"] = st.sidebar.toggle("Allow unsafe SQL (non-SELECT)", value=allow_unsafe_default)
+    auto_sync = st.sidebar.toggle("Auto-sync selected table to main view", value=True, key="auto_sync")
 
-    # ---- Connection Status + Diagnostics ----
+    # Diagnostics
     st.sidebar.markdown("---")
     st.sidebar.subheader("Connection status")
     st.sidebar.caption(f"DBAPI: **{DBAPI}**")
-
-    src = st.session_state.get("profiles_source")
-    st.sidebar.caption(f"Profiles source: **{src}**")
+    st.sidebar.caption(f"Profiles source: **{st.session_state.get('profiles_source')}**")
     with st.sidebar.expander("Profiles from Secrets UI"):
         st.write(", ".join(st.session_state.get("profiles_from_secrets_ui", [])) or "—")
     with st.sidebar.expander("Profiles from Secrets FILE"):
@@ -466,14 +456,13 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str]:
         f"Pwd: {'✅' if base_profile.password else '—'}"
     )
 
-    # Try connecting to the configured DB first; if it fails with "Cannot open database",
-    # auto-fallback to master so we can enumerate DBs.
+    # Attempt configured DB; if fails (cannot open DB), connect to master to enumerate DBs
     configured_url = build_url(base_profile, None)
     ok, err = try_connect(configured_url)
     effective_db = base_profile.database
     effective_url = configured_url
-
     fallback_used = False
+
     if not ok and ("Cannot open database" in err or "Login failed" in err):
         master_url = build_url(base_profile, "master")
         ok2, err2 = try_connect(master_url)
@@ -483,7 +472,6 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str]:
             effective_url = master_url
             st.sidebar.info("Connected to **master** to discover databases (original DB could not be opened).")
         else:
-            # show original error; master also failed
             st.sidebar.code(err or err2)
 
     st.sidebar.write(f"Credentials present: **{'Yes' if bool(configured_url) else 'No'}**")
@@ -497,37 +485,101 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str]:
         if err:
             st.sidebar.code(err)
 
-    # --- Database dropdown ---
+    # DB dropdown
     db_candidates = list_databases(effective_url) if (ok or fallback_used) else []
-    # Put configured DB first if it exists in the list
     initial = effective_db if effective_db in db_candidates else (db_candidates[0] if db_candidates else effective_db or "master")
-    selected_db = st.sidebar.selectbox("Database", db_candidates or [initial], index=(db_candidates.index(initial) if db_candidates and initial in db_candidates else 0))
+    selected_db = st.sidebar.selectbox(
+        "Database",
+        db_candidates or [initial],
+        index=(db_candidates.index(initial) if db_candidates and initial in db_candidates else 0),
+        key="db_select"
+    )
 
-    # Rebuild URL using the selected database
+    # Build effective URL/profile with selected DB
     effective_url = build_url(base_profile, selected_db)
-    # Keep a copy of an "effective profile" (same as base, but with selected DB)
     effective_profile = replace(base_profile, database=selected_db)
 
-    return effective_profile, effective_url
+    # Object picker
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Choose COMM/VW table/view")
+    objs = list_comm_vw_objects(effective_url)
+    if objs.empty:
+        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw* in this DB.")
+        chosen_label = None
+        chosen = None
+    else:
+        q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
+        filt = objs[
+            objs["schema_name"].str.lower().str.contains(q) | objs["object_name"].str.lower().str.contains(q)
+        ] if q else objs
+        if filt.empty:
+            st.sidebar.info("No matches for current filter.")
+            chosen_label = None
+            chosen = None
+        else:
+            labels = [f"{r.schema_name}.{r.object_name}  •  {r.object_type}" for r in filt.itertuples(index=False)]
+            chosen_label = st.sidebar.selectbox("Table/View", labels, index=0, key="object_select")
+            idx = labels.index(chosen_label)
+            chosen = filt.iloc[idx]
+            st.sidebar.caption(f"Selected: `{chosen['schema_name']}.{chosen['object_name']}`")
 
-# -------------------------- Page sections --------------------------
+            # Buttons
+            n = st.sidebar.number_input("Preview rows", 10, 2000, 200, step=10, key="preview_rows")
+            cA, cB = st.sidebar.columns(2)
+            with cA:
+                if st.button("Preview", key="btn_preview"):
+                    st.dataframe(preview_object(effective_url, chosen["schema_name"], chosen["object_name"], int(n)))
+            with cB:
+                if st.button("Use in Query", key="btn_use_in_query"):
+                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{chosen['schema_name']}].[{chosen['object_name']}]"
+                    try:
+                        st.session_state["last_df"] = preview_object(effective_url, chosen["schema_name"], chosen["object_name"], 1000)
+                        st.session_state["data_source"] = f"{effective_profile.database}.{chosen['schema_name']}.{chosen['object_name']}"
+                        st.success("Main view updated from selection.")
+                    except Exception as e:
+                        st.warning(str(e)[:300])
 
-def section_query(profile: ServerProfile, url: str):
+            # Auto-sync: update main view when selection changes
+            current_sel_key = f"{effective_profile.database}|{chosen['schema_name']}.{chosen['object_name']}"
+            if st.session_state.get("selected_object_key") != current_sel_key:
+                st.session_state["selected_object_key"] = current_sel_key
+                if auto_sync:
+                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{chosen['schema_name']}].[{chosen['object_name']}]"
+                    st.session_state["last_df"] = preview_object(effective_url, chosen["schema_name"], chosen["object_name"], 1000)
+                    st.session_state["data_source"] = f"{effective_profile.database}.{chosen['schema_name']}.{chosen['object_name']}"
+                    st.rerun()
+
+    state = {
+        "profile": effective_profile,
+        "url": effective_url,
+        "chosen": chosen,
+        "auto_sync": auto_sync
+    }
+    return effective_profile, effective_url, state
+
+def section_query(url: str, state: Dict[str, Any]):
     st.header("Query")
-    st.caption(f"Connected DB: **{profile.database}**")
+    ds = st.session_state.get("data_source", "Demo dataset")
+    st.caption(f"Connected DB: **{state['profile'].database}** • Data source: **{ds}**")
+
     default_sql = st.session_state.get("last_sql", "SELECT TOP 100 * FROM sys.tables")
-    sql = st.text_area("SQL (SELECT-only by default)", value=default_sql, height=140)
+    sql = st.text_area("SQL (SELECT-only by default)", value=default_sql, height=140, key="sql_editor")
     c1, c2, c3, _ = st.columns([1,1,1,2])
     with c1:
-        limit = st.number_input("Row limit", 1000, 500000, 50000, step=1000)
+        limit = st.number_input("Row limit", 1000, 500000, 50000, step=1000, key="row_limit")
     with c2:
-        run_btn = st.button("Run query")
+        run_btn = st.button("Run query", key="btn_run_query")
     with c3:
-        use_demo = st.toggle("Use demo data", value=False)
+        use_demo = st.toggle("Use demo data", value=False, key="use_demo_toggle")
 
     if run_btn:
         st.session_state["last_sql"] = sql
-        df = demo_dataset() if use_demo else run_sql(profile, url, sql, limit=limit)
+        if use_demo or not url:
+            df = demo_dataset()
+            st.session_state["data_source"] = "Demo dataset"
+        else:
+            df = run_sql(url, sql, limit=limit)
+            st.session_state["data_source"] = f"{state['profile'].database} (custom SQL)"
         st.session_state["last_df"] = df
 
     df = st.session_state.get("last_df", demo_dataset())
@@ -598,7 +650,7 @@ def section_dashboard(url: str):
                     dash.tiles.pop(i)
                     st.session_state["dashboard_spec"] = json.loads(DashboardSpec(title=dash.title, tiles=dash.tiles).model_dump_json())
                     st.rerun()
-            df = dataset_from_sql_or_demo(url, t.dataset_sql)
+            df = run_sql(url, t.dataset_sql) if (t.dataset_sql and url) else demo_dataset()
             render_chart(apply_filters(df, t.filters), t)
 
 # -------------------------- KPIs --------------------------
@@ -619,54 +671,22 @@ def main():
     st.set_page_config(page_title="Helix Commercial Analyzer", layout="wide")
 
     config = load_config(CONFIG_PATH)
-    effective_profile, effective_url = sidebar_controls(config)
+    profile, url, state = sidebar_controls(config)
 
-    # Reset state when server or db changes
-    cur_key = connection_key(effective_profile.name, effective_profile.host, effective_profile.database)
+    # Reset state when server / db changes
+    cur_key = connection_key(profile.name, profile.host, profile.database)
     prev_key = st.session_state.get("active_profile_key")
     if prev_key != cur_key:
         st.session_state["active_profile_key"] = cur_key
         st.session_state.pop("last_df", None)
         st.session_state.pop("last_sql", None)
+        st.session_state["data_source"] = "Demo dataset"
         st.cache_data.clear()
 
-    # COMM/VW picker (URL-based)
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Choose COMM/VW table/view")
-    objs = list_comm_vw_objects(effective_url)
-    if objs.empty:
-        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw* in this DB.")
-    else:
-        q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
-        filt = objs[
-            objs["schema_name"].str.lower().str.contains(q) | objs["object_name"].str.lower().str.contains(q)
-        ] if q else objs
-        if filt.empty:
-            st.sidebar.info("No matches for current filter.")
-        else:
-            labels = [f"{r.schema_name}.{r.object_name}  •  {r.object_type}" for r in filt.itertuples(index=False)]
-            chosen = st.sidebar.selectbox("Table/View", labels, index=0)
-            idx = labels.index(chosen)
-            sel = filt.iloc[idx]
-            st.sidebar.caption(f"Selected: `{sel['schema_name']}.{sel['object_name']}`")
-            n = st.sidebar.number_input("Preview rows", 10, 2000, 200, step=10)
-            cA, cB = st.sidebar.columns(2)
-            with cA:
-                if st.button("Preview"):
-                    st.dataframe(preview_object(effective_url, sel["schema_name"], sel["object_name"], int(n)))
-            with cB:
-                if st.button("Use in Query"):
-                    st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{sel['schema_name']}].[{sel['object_name']}]"
-                    try:
-                        st.session_state["last_df"] = preview_object(effective_url, sel["schema_name"], sel["object_name"], 1000)
-                        st.success("Query editor updated from selection.")
-                    except Exception as e:
-                        st.warning(str(e)[:300])
-
-    df = section_query(effective_profile, effective_url)
+    df = section_query(url, state)
     kpi_rail(df)
     section_chart_builder(df)
-    section_dashboard(effective_url)
+    section_dashboard(url)
 
 if __name__ == "__main__":
     main()
