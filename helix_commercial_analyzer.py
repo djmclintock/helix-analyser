@@ -10,12 +10,14 @@ Helix Commercial Analyzer — Streamlit MVP
     2) .streamlit/secrets.toml in the repo (fallback), else
     3) helix_config.yaml
 - TLS for pytds: pass cafile/validate_host via create_engine(connect_args=...)
+- NEW: Auto-fallback to master if DB open fails, DB dropdown to switch databases,
+       and per-DB connection URLs.
 """
 
 from __future__ import annotations
 
 import json, os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Dict, Any, Tuple
 
 import pandas as pd
@@ -28,7 +30,7 @@ from urllib.parse import quote_plus
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-# NEW: certifi gives us a portable CA bundle path for TLS
+# TLS CA bundle for pytds
 import certifi
 
 # Optional YAML for local dev config
@@ -178,17 +180,17 @@ def load_config(path: str) -> AppConfig:
 
     return AppConfig(servers=servers, options=options)
 
-# -------------------------- Connectivity --------------------------
+# -------------------------- Connectivity helpers --------------------------
 
-def get_sqlalchemy_url(p: ServerProfile) -> str:
+def build_url(p: ServerProfile, db_override: Optional[str] = None) -> str:
+    """Build an SQLAlchemy URL for this profile, optionally overriding the database."""
     user = (p.username or "").strip()
     pwd  = (p.password or "").strip()
     host = (p.host or "").strip()
-    db   = (p.database or "").strip()
+    db   = (db_override if db_override is not None else p.database or "").strip()
     if not (host and db):
         return ""
     if DBAPI == "pytds":
-        # Base URL without TLS args; we'll pass TLS via connect_args in create_engine.
         if not (user and pwd):
             return ""
         return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}"
@@ -202,27 +204,24 @@ def get_sqlalchemy_url(p: ServerProfile) -> str:
         )
         return f"mssql+pyodbc:///?odbc_connect={quote_plus(params)}"
 
-def connection_key(p: ServerProfile) -> str:
-    return f"{p.name}|{p.host}|{p.database}|{DBAPI}"
+def connection_key(name: str, host: str, db: str) -> str:
+    return f"{name}|{host}|{db}|{DBAPI}"
 
 @st.cache_resource(show_spinner=False)
 def get_engine_for_url(url: str) -> Optional[Engine]:
     if create_engine is None or not url:
         return None
-    # **TLS for pytds** — pass DBAPI args explicitly (recommended by SQLAlchemy)
-    # so we don't rely on the dialect parsing URL query params. :contentReference[oaicite:1]{index=1}
+    # pytds needs TLS params passed via connect_args (cafile enables encryption)
     if DBAPI == "pytds":
         return create_engine(
             url,
-            connect_args={
-                "cafile": certifi.where(),   # enables TLS in python-tds :contentReference[oaicite:2]{index=2}
-                "validate_host": True,       # hostname verification (default True)
-            },
+            connect_args={"cafile": certifi.where(), "validate_host": True},
             pool_pre_ping=True,
         )
     return create_engine(url, pool_pre_ping=True)
 
-def try_connect(engine: Optional[Engine]) -> Tuple[bool, str]:
+def try_connect(url: str) -> Tuple[bool, str]:
+    engine = get_engine_for_url(url) if url else None
     if engine is None:
         return False, "No engine (missing URL/credentials)."
     try:
@@ -237,27 +236,40 @@ def try_connect(engine: Optional[Engine]) -> Tuple[bool, str]:
 
 @st.cache_data(show_spinner=False)
 def run_sql_cached(url: str, sql: str, params: Optional[Dict[str, Any]], limit: int) -> pd.DataFrame:
-    engine: Engine = get_engine_for_url(url)  # reuse same connect_args
+    engine: Engine = get_engine_for_url(url)
     with engine.begin() as conn:
         df = pd.read_sql(text(sql), conn, params=params)
-    if len(df) > limit:
-        df = df.head(limit)
-    return df
+    return df.head(limit) if len(df) > limit else df
 
-def run_sql(profile: ServerProfile, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
+def run_sql(profile: ServerProfile, url: str, sql: str, params: Optional[Dict[str, Any]] = None, limit: int = 100000) -> pd.DataFrame:
     if create_engine is None:
         st.error("SQLAlchemy missing. Install dependencies.")
         return pd.DataFrame()
     if not sql.strip().lower().startswith("select") and not st.session_state.get("allow_unsafe_sql", False):
         st.error("Only SELECT statements are allowed.")
         return pd.DataFrame()
-    url = get_sqlalchemy_url(profile)
     if not url:
         st.warning("No database credentials detected for selected profile. Using demo data.")
         return demo_dataset()
     return run_sql_cached(url, sql, params, limit)
 
-# -------------------------- COMM/VW listing (URL-based cache) --------------------------
+# -------------------------- DB discovery & object listing --------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_databases(url: str) -> List[str]:
+    """List non-system databases from this server."""
+    if not url:
+        return []
+    engine = get_engine_for_url(url)
+    if engine is None:
+        return []
+    try:
+        with engine.connect() as conn:
+            q = sa.text("SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name;")
+            rows = conn.execute(q).fetchall()
+            return [r[0] for r in rows]
+    except Exception:
+        return []
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_comm_vw_objects(url: str) -> pd.DataFrame:
@@ -272,7 +284,7 @@ def list_comm_vw_objects(url: str) -> pd.DataFrame:
             if dialect == "mssql":
                 sql = sa.text("""
                     SELECT s.name AS schema_name, t.name AS object_name, 'BASE TABLE' AS object_type
-                    FROM sys.tables t JOIN sYS.schemas s ON s.schema_id = t.schema_id
+                    FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
                     WHERE (LOWER(t.name) LIKE 'comm%' AND LOWER(t.name) NOT LIKE 'commercial%')
                        OR LOWER(t.name) LIKE 'vw%'
                     UNION ALL
@@ -368,8 +380,8 @@ class DashboardSpec(BaseModel):
 
 # -------------------------- UI helpers --------------------------
 
-def dataset_from_sql_or_demo(profile: ServerProfile, sql: Optional[str]) -> pd.DataFrame:
-    return run_sql(profile, sql) if (sql and sql.strip()) else demo_dataset()
+def dataset_from_sql_or_demo(url: str, sql: Optional[str]) -> pd.DataFrame:
+    return run_sql_cached(url, sql, None, 100000) if (sql and sql.strip()) else demo_dataset()
 
 def apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     out = df.copy()
@@ -420,14 +432,15 @@ def render_chart(df: pd.DataFrame, spec: TileSpec):
 
 # -------------------------- Sidebar --------------------------
 
-def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[Engine], str]:
+def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str]:
     st.sidebar.title("Helix Commercial Analyzer")
     st.sidebar.caption("Select your server and options")
     if not config.servers:
         st.sidebar.warning("No servers configured (add Secrets or .streamlit/secrets.toml).")
     names = [s.name for s in config.servers] or ["Demo (no DB)"]
     choice = st.sidebar.selectbox("Server profile", names, index=0)
-    profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
+    base_profile = next((s for s in config.servers if s.name == choice), ServerProfile("demo","demo","",""))
+
     allow_unsafe_default = bool(config.options.get("allow_unsafe_sql", False))
     st.session_state["allow_unsafe_sql"] = st.sidebar.toggle("Allow unsafe SQL (non-SELECT)", value=allow_unsafe_default)
 
@@ -447,50 +460,61 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[E
 
     st.sidebar.write(
         "Fields present — "
-        f"Host: {'✅' if profile.host else '—'} · "
-        f"DB: {'✅' if profile.database else '—'} · "
-        f"User: {'✅' if profile.username else '—'} · "
-        f"Pwd: {'✅' if profile.password else '—'}"
+        f"Host: {'✅' if base_profile.host else '—'} · "
+        f"DB: {'✅' if base_profile.database else '—'} · "
+        f"User: {'✅' if base_profile.username else '—'} · "
+        f"Pwd: {'✅' if base_profile.password else '—'}"
     )
 
-    url = get_sqlalchemy_url(profile)
-    st.sidebar.write(f"Credentials present: **{'Yes' if bool(url) else 'No'}**")
-    if DBAPI == "pytds" and url:
+    # Try connecting to the configured DB first; if it fails with "Cannot open database",
+    # auto-fallback to master so we can enumerate DBs.
+    configured_url = build_url(base_profile, None)
+    ok, err = try_connect(configured_url)
+    effective_db = base_profile.database
+    effective_url = configured_url
+
+    fallback_used = False
+    if not ok and ("Cannot open database" in err or "Login failed" in err):
+        master_url = build_url(base_profile, "master")
+        ok2, err2 = try_connect(master_url)
+        if ok2:
+            fallback_used = True
+            effective_db = "master"
+            effective_url = master_url
+            st.sidebar.info("Connected to **master** to discover databases (original DB could not be opened).")
+        else:
+            # show original error; master also failed
+            st.sidebar.code(err or err2)
+
+    st.sidebar.write(f"Credentials present: **{'Yes' if bool(configured_url) else 'No'}**")
+    if DBAPI == "pytds" and (configured_url or effective_url):
         st.sidebar.caption(f"TLS (pytds) CA: `{certifi.where()}`")
 
-    engine = get_engine_for_url(url) if url else None
-    ok, err = try_connect(engine)
-    if ok:
+    if ok or fallback_used:
         st.sidebar.success("Connected")
     else:
         st.sidebar.info("Not connected")
         if err:
             st.sidebar.code(err)
 
-    # Save/Load dashboard
-    st.sidebar.markdown("---")
-    st.sidebar.write("**Save / Load dashboard**")
-    dl = st.session_state.get("dashboard_spec")
-    if dl:
-        st.sidebar.download_button("Download dashboard JSON", data=json.dumps(dl, indent=2),
-                                   file_name=f"{dl['title']}.json", mime="application/json")
-    up = st.sidebar.file_uploader("Load dashboard JSON", type=["json"])
-    if up is not None:
-        try:
-            spec = json.load(up)
-            DashboardSpec(**spec)
-            st.session_state["dashboard_spec"] = spec
-            st.sidebar.success("Dashboard loaded.")
-        except Exception as e:
-            st.sidebar.error(f"Invalid JSON: {e}")
+    # --- Database dropdown ---
+    db_candidates = list_databases(effective_url) if (ok or fallback_used) else []
+    # Put configured DB first if it exists in the list
+    initial = effective_db if effective_db in db_candidates else (db_candidates[0] if db_candidates else effective_db or "master")
+    selected_db = st.sidebar.selectbox("Database", db_candidates or [initial], index=(db_candidates.index(initial) if db_candidates and initial in db_candidates else 0))
 
-    return profile, st.session_state.get("allow_unsafe_sql", False), engine, url
+    # Rebuild URL using the selected database
+    effective_url = build_url(base_profile, selected_db)
+    # Keep a copy of an "effective profile" (same as base, but with selected DB)
+    effective_profile = replace(base_profile, database=selected_db)
+
+    return effective_profile, effective_url
 
 # -------------------------- Page sections --------------------------
 
-def section_query(profile: ServerProfile):
+def section_query(profile: ServerProfile, url: str):
     st.header("Query")
-    st.caption("Run a SELECT query or use the demo dataset if not connected.")
+    st.caption(f"Connected DB: **{profile.database}**")
     default_sql = st.session_state.get("last_sql", "SELECT TOP 100 * FROM sys.tables")
     sql = st.text_area("SQL (SELECT-only by default)", value=default_sql, height=140)
     c1, c2, c3, _ = st.columns([1,1,1,2])
@@ -503,7 +527,7 @@ def section_query(profile: ServerProfile):
 
     if run_btn:
         st.session_state["last_sql"] = sql
-        df = demo_dataset() if use_demo else run_sql(profile, sql, limit=limit)
+        df = demo_dataset() if use_demo else run_sql(profile, url, sql, limit=limit)
         st.session_state["last_df"] = df
 
     df = st.session_state.get("last_df", demo_dataset())
@@ -556,7 +580,7 @@ def section_chart_builder(df: pd.DataFrame) -> TileSpec:
     render_chart(apply_filters(df, filters), spec)
     return spec
 
-def section_dashboard(profile: ServerProfile):
+def section_dashboard(url: str):
     st.header("Dashboard")
     spec = st.session_state.get("dashboard_spec", {"title":"Commercial Dashboard","tiles":[]})
     dash = DashboardSpec(**spec)
@@ -574,7 +598,7 @@ def section_dashboard(profile: ServerProfile):
                     dash.tiles.pop(i)
                     st.session_state["dashboard_spec"] = json.loads(DashboardSpec(title=dash.title, tiles=dash.tiles).model_dump_json())
                     st.rerun()
-            df = dataset_from_sql_or_demo(profile, t.dataset_sql)
+            df = dataset_from_sql_or_demo(url, t.dataset_sql)
             render_chart(apply_filters(df, t.filters), t)
 
 # -------------------------- KPIs --------------------------
@@ -595,10 +619,10 @@ def main():
     st.set_page_config(page_title="Helix Commercial Analyzer", layout="wide")
 
     config = load_config(CONFIG_PATH)
-    profile, _, engine, url = sidebar_controls(config)
+    effective_profile, effective_url = sidebar_controls(config)
 
-    # Reset state when server changes
-    cur_key = connection_key(profile)
+    # Reset state when server or db changes
+    cur_key = connection_key(effective_profile.name, effective_profile.host, effective_profile.database)
     prev_key = st.session_state.get("active_profile_key")
     if prev_key != cur_key:
         st.session_state["active_profile_key"] = cur_key
@@ -609,9 +633,9 @@ def main():
     # COMM/VW picker (URL-based)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Choose COMM/VW table/view")
-    objs = list_comm_vw_objects(url)
+    objs = list_comm_vw_objects(effective_url)
     if objs.empty:
-        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw*.")
+        st.sidebar.info("No objects matching comm* (excluding commercial*) or vw* in this DB.")
     else:
         q = st.sidebar.text_input("Filter", placeholder="e.g. comm_register, vw_", value="").strip().lower()
         filt = objs[
@@ -629,20 +653,20 @@ def main():
             cA, cB = st.sidebar.columns(2)
             with cA:
                 if st.button("Preview"):
-                    st.dataframe(preview_object(url, sel["schema_name"], sel["object_name"], int(n)))
+                    st.dataframe(preview_object(effective_url, sel["schema_name"], sel["object_name"], int(n)))
             with cB:
                 if st.button("Use in Query"):
                     st.session_state["last_sql"] = f"SELECT TOP 1000 * FROM [{sel['schema_name']}].[{sel['object_name']}]"
                     try:
-                        st.session_state["last_df"] = preview_object(url, sel["schema_name"], sel["object_name"], 1000)
+                        st.session_state["last_df"] = preview_object(effective_url, sel["schema_name"], sel["object_name"], 1000)
                         st.success("Query editor updated from selection.")
                     except Exception as e:
                         st.warning(str(e)[:300])
 
-    df = section_query(profile)
+    df = section_query(effective_profile, effective_url)
     kpi_rail(df)
     section_chart_builder(df)
-    section_dashboard(profile)
+    section_dashboard(effective_url)
 
 if __name__ == "__main__":
     main()
