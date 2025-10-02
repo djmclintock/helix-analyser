@@ -2,14 +2,14 @@
 Helix Commercial Analyzer — Streamlit MVP
 - COMM/VW picker with preview + “Use in Query”
 - Per-server caching & server-change reset
-- Plotly: use config= (no deprecated kwargs)
+- Plotly: config= usage (no deprecated kwargs)
 - Pydantic v2 (@field_validator)
 - Connection diagnostics
 - Reads server profiles from:
     1) Secrets UI (preferred), or
     2) .streamlit/secrets.toml in the repo (fallback), else
     3) helix_config.yaml
-- TLS for pytds: uses certifi CA bundle via ?cafile=... (required for encrypted servers)
+- TLS for pytds: pass cafile/validate_host via create_engine(connect_args=...)
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from urllib.parse import quote_plus
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-# NEW: certifi gives us a portable CA bundle path
+# NEW: certifi gives us a portable CA bundle path for TLS
 import certifi
 
 # Optional YAML for local dev config
@@ -164,17 +164,11 @@ def load_config(path: str) -> AppConfig:
     y_servers, y_opts = _profiles_from_yaml(path)
 
     if s1:
-        source = "secrets-ui"
-        servers = s1
-        options = y_opts
+        source = "secrets-ui"; servers = s1; options = y_opts
     elif s2:
-        source = "secrets-file"
-        servers = s2
-        options = y_opts
+        source = "secrets-file"; servers = s2; options = y_opts
     else:
-        source = "yaml"
-        servers = y_servers
-        options = y_opts
+        source = "yaml"; servers = y_servers; options = y_opts
 
     # Diagnostics (safe: names only)
     st.session_state["profiles_source"] = source
@@ -194,16 +188,10 @@ def get_sqlalchemy_url(p: ServerProfile) -> str:
     if not (host and db):
         return ""
     if DBAPI == "pytds":
-        # TLS: pytds enables encryption only when 'cafile' is supplied.
-        # Use certifi to provide a CA bundle path that validates Azure's cert chain.
+        # Base URL without TLS args; we'll pass TLS via connect_args in create_engine.
         if not (user and pwd):
             return ""
-        cafile = certifi.where()
-        # validate_host defaults to True; include explicitly for clarity.
-        return (
-            f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}"
-            f"@{host}:1433/{db}?cafile={quote_plus(cafile)}&validate_host=true"
-        )
+        return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}"
     else:
         if not (user and pwd):
             return ""
@@ -221,7 +209,18 @@ def connection_key(p: ServerProfile) -> str:
 def get_engine_for_url(url: str) -> Optional[Engine]:
     if create_engine is None or not url:
         return None
-    return create_engine(url)
+    # **TLS for pytds** — pass DBAPI args explicitly (recommended by SQLAlchemy)
+    # so we don't rely on the dialect parsing URL query params. :contentReference[oaicite:1]{index=1}
+    if DBAPI == "pytds":
+        return create_engine(
+            url,
+            connect_args={
+                "cafile": certifi.where(),   # enables TLS in python-tds :contentReference[oaicite:2]{index=2}
+                "validate_host": True,       # hostname verification (default True)
+            },
+            pool_pre_ping=True,
+        )
+    return create_engine(url, pool_pre_ping=True)
 
 def try_connect(engine: Optional[Engine]) -> Tuple[bool, str]:
     if engine is None:
@@ -238,7 +237,7 @@ def try_connect(engine: Optional[Engine]) -> Tuple[bool, str]:
 
 @st.cache_data(show_spinner=False)
 def run_sql_cached(url: str, sql: str, params: Optional[Dict[str, Any]], limit: int) -> pd.DataFrame:
-    engine: Engine = create_engine(url)
+    engine: Engine = get_engine_for_url(url)  # reuse same connect_args
     with engine.begin() as conn:
         df = pd.read_sql(text(sql), conn, params=params)
     if len(df) > limit:
@@ -273,7 +272,7 @@ def list_comm_vw_objects(url: str) -> pd.DataFrame:
             if dialect == "mssql":
                 sql = sa.text("""
                     SELECT s.name AS schema_name, t.name AS object_name, 'BASE TABLE' AS object_type
-                    FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    FROM sys.tables t JOIN sYS.schemas s ON s.schema_id = t.schema_id
                     WHERE (LOWER(t.name) LIKE 'comm%' AND LOWER(t.name) NOT LIKE 'commercial%')
                        OR LOWER(t.name) LIKE 'vw%'
                     UNION ALL
