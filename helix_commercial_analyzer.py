@@ -1,26 +1,26 @@
 """
-Helix Commercial Analyzer — Environmental Tracker
+Helix Commercial Analyzer — Environmental Tracker (DB-native refs)
 
-LEFT (unchanged):
-  - Server + DB + COMM/VW picker with preview
+LEFT:
+  • Server + DB + COMM/VW picker with preview
+  • NEW: Reference tables (from DB): CII bands, EEXI, FuelEU targets
+
 RIGHT:
-  - Data grid with global search + filters
-  - Environmental tabs:
-      • CII (fleet & vessel views, bands overlay via CSV/DB)
-      • EU MRV (voyage/month/year KPIs + charts)
-      • EEXI (attained vs required, compliance margin)
-      • Hull Fouling indicator (rolling normalized fuel-per-nm)
-      • EU ETS estimator (phase-in, voyage share controls)
-      • FuelEU (GHG intensity vs target)
-  - Dashboard viewer (read-only JSON)
+  • Data grid with global search + filters
+  • Environmental tabs:
+      – CII (fleet & vessel views; bands from DB view if provided)
+      – EU MRV (KPIs + CO₂ by month)
+      – EEXI (uses DB EEXI table if provided; otherwise map columns)
+      – Hull fouling (rolling fuel-per-nm degradation)
+      – EU ETS (allowances & € estimate)
+      – FuelEU (intensity vs target; target from DB if provided)
+  • Dashboard viewer (read-only JSON)
 
-Important:
-  - This code provides scaffolding + indicative calcs.
-  - Plug in official factors/thresholds from CSV/DB views for production compliance.
+NOTE: Calcs are indicative. Wire your authoritative factors/thresholds via DB views.
 """
 
 from __future__ import annotations
-import os, json
+import os, json, re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,7 +35,7 @@ from urllib.parse import quote_plus
 
 import certifi  # TLS bundle for pytds
 
-# Optional YAML/TOML (local fallback config and repo-side secrets)
+# Optional YAML/TOML for local config and repo secrets
 try:
     import yaml
 except Exception:
@@ -265,28 +265,42 @@ def list_comm_vw_objects(url: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["schema_name","object_name","object_type"])
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_table_sample(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
-    if not url: return pd.DataFrame()
+# Generic DB read for a fully-qualified object like "dbo.vw_cii_bands"
+@st.cache_data(ttl=600, show_spinner=False)
+def read_ref_table(url: str, fq_name: str) -> pd.DataFrame:
+    if not url or not fq_name: return pd.DataFrame()
+    # Accept dbo.vw; [dbo].[vw]; or just vw (we'll resolve schema below)
+    schema, obj = parse_fq(fq_name)
+    if schema is None:
+        schema = resolve_schema_for_object(url, obj)  # try to find schema for object name
+        if schema is None: return pd.DataFrame()
     engine = get_engine_for_url(url)
-    if engine is None: return pd.DataFrame()
-    dialect = engine.dialect.name.lower()
     with engine.connect() as conn:
-        if dialect == "mssql":
-            sql = sa.text(f"SELECT TOP {int(limit)} * FROM [{schema}].[{name}]")
-        else:
-            prep = sa.sql.compiler.IdentifierPreparer(engine.dialect)
-            fq = f"{prep.quote_identifier(schema)}.{prep.quote_identifier(name)}"
-            sql = sa.text(f"SELECT * FROM {fq} LIMIT {int(limit)}")
-        df = pd.read_sql(sql, conn)
-    # best-effort datetime parsing
-    for c in df.columns:
-        if df[c].dtype == object:
-            try: df[c] = pd.to_datetime(df[c], errors="ignore")
-            except Exception: pass
-    return df
+        q = sa.text(f"SELECT * FROM [{schema}].[{obj}]")
+        return pd.read_sql(q, conn)
 
-# -------------------------- Demo data --------------------------
+def parse_fq(name: str) -> Tuple[Optional[str], str]:
+    s = name.strip().strip("[]")
+    if "." in s:
+        parts = [p.strip().strip("[]") for p in s.split(".", 1)]
+        return parts[0], parts[1]
+    return None, s
+
+@st.cache_data(ttl=600, show_spinner=False)
+def resolve_schema_for_object(url: str, obj_name: str) -> Optional[str]:
+    if not url or not obj_name: return None
+    engine = get_engine_for_url(url)
+    with engine.connect() as conn:
+        q = sa.text("""
+            SELECT TOP 1 s.name AS schema_name
+            FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
+            WHERE LOWER(o.name)=LOWER(:obj) AND o.type IN ('U','V')
+            ORDER BY CASE WHEN s.name='dbo' THEN 0 ELSE 1 END, s.name
+        """)
+        row = conn.execute(q, {"obj": obj_name}).fetchone()
+        return row[0] if row else None
+
+# -------------------------- Demo dataset --------------------------
 
 def demo_dataset() -> pd.DataFrame:
     np.random.seed(7)
@@ -297,17 +311,11 @@ def demo_dataset() -> pd.DataFrame:
         dwt = np.random.randint(140000, 180000)
         for d in dates:
             dist = np.random.uniform(0, 500)
-            fuel = dist * np.random.uniform(0.015, 0.030)  # t/day proxy
+            fuel = dist * np.random.uniform(0.015, 0.030)
             rows.append({
-                "vessel": v,
-                "date": d,
-                "distance_nm": dist,
-                "fuel_t": fuel,
-                "co2_t": fuel*3.114,  # HFO-ish
-                "dwt": dwt,
-                "voyage_id": f"{v.split()[1]}-{d.month}",
-                "ship_type": "LNG",
-                "speed_kt": np.random.uniform(9, 19),
+                "vessel": v, "date": d, "distance_nm": dist, "fuel_t": fuel,
+                "co2_t": fuel*3.114, "dwt": dwt, "voyage_id": f"{v.split()[1]}-{d.month}",
+                "ship_type": "LNG", "speed_kt": np.random.uniform(9, 19),
                 "power_mw": np.random.uniform(10, 25),
             })
     return pd.DataFrame(rows)
@@ -346,7 +354,7 @@ def apply_filters(df: pd.DataFrame, dt_cols: List[str]) -> pd.DataFrame:
                 if sel: out = out[out[c].astype(str).isin(sel)]
     return out
 
-# -------------------------- Sidebar (server/DB/table) --------------------------
+# -------------------------- Sidebar (server/DB/table + REF TABLES) --------------------------
 
 def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Dict[str, Any]]:
     st.sidebar.title("Helix Commercial Analyzer")
@@ -386,8 +394,7 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Dict[str, A
             effective_db, effective_url = "master", master_url
             st.sidebar.info("Connected to **master** to discover databases (configured DB not accessible).")
         else:
-            st.sidebar.info("Not connected")
-            st.sidebar.code(err or err2)
+            st.sidebar.info("Not connected"); st.sidebar.code(err or err2)
 
     st.sidebar.write(f"Credentials present: **{'Yes' if bool(configured_url) else 'No'}**")
     if DBAPI == "pytds" and (configured_url or effective_url):
@@ -426,20 +433,331 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, str, Dict[str, A
                 st.session_state["last_df"] = fetch_table_sample(effective_url, chosen["schema_name"], chosen["object_name"], int(n))
                 st.session_state["data_source"] = f"{selected_db}.{chosen['schema_name']}.{chosen['object_name']}"
 
-    # Dashboard JSON loader (viewer)
+    # ---------- Reference tables (from DB) ----------
     st.sidebar.markdown("---")
-    st.sidebar.write("**Load dashboard JSON**")
-    up = st.sidebar.file_uploader("Load dashboard JSON", type=["json"])
-    if up is not None:
-        try:
-            spec = json.load(up)
-            DashboardSpec(**spec)  # validate
-            st.session_state["dashboard_spec"] = spec
-            st.sidebar.success("Dashboard loaded.")
-        except Exception as e:
-            st.sidebar.error(f"Invalid JSON: {e}")
+    st.sidebar.subheader("Reference tables (from DB)")
 
-    return effective_profile, effective_url, {"chosen": chosen}
+    def pick_ref(label: str, hint_patterns: List[str]) -> str:
+        # Suggest objects by pattern (case-insensitive substring AND logic)
+        name_suggestions = []
+        if not objs.empty:
+            for _, r in objs.iterrows():
+                o = f"{r['schema_name']}.{r['object_name']}"
+                low = o.lower()
+                if all(p in low for p in hint_patterns):
+                    name_suggestions.append(o)
+        name_suggestions = sorted(set(name_suggestions))
+        default_txt = name_suggestions[0] if name_suggestions else ""
+        return st.sidebar.text_input(label, value=st.session_state.get(label, default_txt), placeholder="schema.object (e.g., dbo.vw_cii_bands)")
+
+    cii_ref = pick_ref("CII bands view", ["cii","band"])  # e.g., dbo.vw_cii_bands
+    eexi_ref = pick_ref("EEXI table/view", ["eexi"])
+    fueleu_ref = pick_ref("FuelEU targets view", ["fuel","target"])
+
+    st.session_state["CII bands view"] = cii_ref
+    st.session_state["EEXI table/view"] = eexi_ref
+    st.session_state["FuelEU targets view"] = fueleu_ref
+
+    return effective_profile, effective_url, {"chosen": chosen, "refs": {"cii": cii_ref, "eexi": eexi_ref, "fueleu": fueleu_ref}}
+
+# -------------------------- DB read helpers --------------------------
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_table_sample(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
+    if not url: return pd.DataFrame()
+    engine = get_engine_for_url(url)
+    if engine is None: return pd.DataFrame()
+    dialect = engine.dialect.name.lower()
+    with engine.connect() as conn:
+        if dialect == "mssql":
+            sql = sa.text(f"SELECT TOP {int(limit)} * FROM [{schema}].[{name}]")
+        else:
+            prep = sa.sql.compiler.IdentifierPreparer(engine.dialect)
+            fq = f"{prep.quote_identifier(schema)}.{prep.quote_identifier(name)}"
+            sql = sa.text(f"SELECT * FROM {fq} LIMIT {int(limit)}")
+        df = pd.read_sql(sql, conn)
+    for c in df.columns:
+        if df[c].dtype == object:
+            try: df[c] = pd.to_datetime(df[c], errors="ignore")
+            except Exception: pass
+    return df
+
+# -------------------------- Environmental helpers --------------------------
+
+EF_T_CO2_PER_T_FUEL = {"HFO": 3.114, "LFO": 3.151, "MGO": 3.206, "MDO": 3.206, "LNG": 2.750, "LPG": 3.000}
+
+def co2_from_fuel(df: pd.DataFrame, fuel_t_col: str, fuel_type_col: Optional[str]) -> pd.Series:
+    if fuel_type_col and fuel_type_col in df.columns:
+        ef = df[fuel_type_col].map(EF_T_CO2_PER_T_FUEL).fillna(3.114)
+        return df[fuel_t_col].fillna(0) * ef
+    return df[fuel_t_col].fillna(0) * 3.114
+
+def cii_mapper_ui(df: pd.DataFrame) -> Dict[str, str]:
+    cols = df.columns.tolist()
+    st.caption("Map your CII columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="cii_vessel")
+        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="cii_date")
+    with c2:
+        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="cii_dist")
+        dwt = st.selectbox("DWT / Capacity", cols, index=(cols.index("dwt") if "dwt" in cols else 0), key="cii_dwt")
+    with c3:
+        co2 = st.selectbox("CO2 (t) [optional]", [None]+cols, index=(cols.index("co2_t")+1 if "co2_t" in cols else 0), key="cii_co2")
+        fuel_t = st.selectbox("Fuel (t) [optional]", [None]+cols, index=(cols.index("fuel_t")+1 if "fuel_t" in cols else 0), key="cii_fuel_t")
+    ship_type = st.selectbox("Ship type (for bands)", [c for c in ["LNG","Tanker","Bulkcarrier","Container","Other"]], index=0, key="cii_shiptype")
+    fuel_type = st.selectbox("Fuel type col [optional]", [None]+cols, index=(cols.index("fuel_type")+1 if "fuel_type" in cols else 0), key="cii_fueltype")
+    return {
+        "vessel": vessel, "date": date, "distance_nm": dist, "dwt": dwt,
+        "co2_t": co2 or "", "fuel_t": fuel_t or "", "fuel_type": fuel_type or "", "ship_type": ship_type
+    }
+
+def compute_aer(df: pd.DataFrame, m: Dict[str,str]) -> pd.DataFrame:
+    x = df.copy()
+    if m["co2_t"]:
+        x["co2_t_calc"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
+    elif m["fuel_t"]:
+        x["co2_t_calc"] = co2_from_fuel(x, m["fuel_t"], m["fuel_type"] or None)
+    else:
+        x["co2_t_calc"] = 0.0
+    x["distance_nm_calc"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").fillna(0.0)
+    x["dwt_calc"] = pd.to_numeric(x[m["dwt"]], errors="coerce").fillna(np.nan)
+    x["vessel_calc"] = x[m["vessel"]].astype(str)
+    x["date_calc"] = pd.to_datetime(x[m["date"]], errors="coerce")
+    denom = (x["dwt_calc"] * x["distance_nm_calc"]).replace(0, np.nan)
+    x["aer_g_per_dwt_nm"] = (x["co2_t_calc"] * 1_000_000) / (denom * 1000)
+    return x.rename(columns={
+        "vessel_calc":"vessel","date_calc":"date","dwt_calc":"dwt","distance_nm_calc":"distance_nm","co2_t_calc":"co2_t"
+    })[["vessel","date","dwt","distance_nm","co2_t","aer_g_per_dwt_nm"]]
+
+def fleet_cii_view(aer_df: pd.DataFrame, ship_type: str, bands_df: Optional[pd.DataFrame]):
+    st.subheader("Fleet view")
+    if aer_df.empty:
+        st.info("No data."); return
+    min_date = aer_df["date"].min(); max_date = aer_df["date"].max()
+    d1, d2 = st.date_input("Date range", value=(min_date, max_date), format="YYYY-MM-DD")
+    mask = (aer_df["date"] >= pd.to_datetime(d1)) & (aer_df["date"] <= pd.to_datetime(d2))
+    g = aer_df.loc[mask].groupby("vessel", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"), dwt=("dwt","median"))
+    fig = px.scatter(g, x="dwt", y="aer", hover_name="vessel", title="AER vs DWT (mean over range)")
+    st.plotly_chart(fig, config={"responsive": True, "displaylogo": False})
+    if bands_df is not None and not bands_df.empty:
+        st.caption("Bands loaded from DB (overlay is highly ship-type/DWT specific; wire your exact visuals as needed).")
+
+def vessel_cii_view(aer_df: pd.DataFrame):
+    st.subheader("Vessel detail")
+    if aer_df.empty:
+        st.info("No data."); return
+    vessels = sorted(aer_df["vessel"].dropna().unique().tolist())
+    v = st.selectbox("Vessel", vessels, index=0)
+    mode = st.radio("View by", ["Voyage (requires voyage_id)","Monthly","Yearly"], horizontal=True)
+    dfv = aer_df[aer_df["vessel"]==v].copy()
+    if mode.startswith("Voyage") and "voyage_id" in dfv.columns:
+        grp = dfv.groupby("voyage_id", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
+        fig = px.bar(grp, x="voyage_id", y="aer", title=f"{v} — AER by voyage")
+    elif mode == "Monthly":
+        dfv["month"] = dfv["date"].dt.to_period("M").astype(str)
+        grp = dfv.groupby("month", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
+        fig = px.line(grp, x="month", y="aer", markers=True, title=f"{v} — AER monthly")
+    else:
+        dfv["year"] = dfv["date"].dt.year
+        grp = dfv.groupby("year", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
+        fig = px.line(grp, x="year", y="aer", markers=True, title=f"{v} — AER yearly")
+    st.plotly_chart(fig, config={"responsive": True, "displaylogo": False})
+
+def mrv_mapper_ui(df: pd.DataFrame) -> Dict[str, str]:
+    cols = df.columns.tolist()
+    st.caption("Map your MRV columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="mrv_vessel")
+        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="mrv_date")
+    with c2:
+        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="mrv_dist")
+        cargo = st.selectbox("Cargo carried (t) [optional]", [None]+cols, index=0, key="mrv_cargo")
+    with c3:
+        co2 = st.selectbox("CO2 (t)", cols, index=(cols.index("co2_t") if "co2_t" in cols else 0), key="mrv_co2")
+        port = st.selectbox("Port / Area [optional]", [None]+cols, index=0, key="mrv_port")
+    return {"vessel":vessel,"date":date,"distance_nm":dist,"co2_t":co2,"cargo_t":cargo or "","port":port or ""}
+
+def mrv_kpis_and_plots(df: pd.DataFrame, m: Dict[str,str]):
+    x = df.copy()
+    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
+    x["co2_t"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
+    x["distance_nm"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").fillna(0.0)
+    if m["cargo_t"]:
+        x["cargo_t"] = pd.to_numeric(x[m["cargo_t"]], errors="coerce").fillna(np.nan)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Total CO₂ (t)", f"{x['co2_t'].sum():,.0f}")
+    k2.metric("Total distance (nm)", f"{x['distance_nm'].sum():,.0f}")
+    if m["cargo_t"]:
+        denom = (x["cargo_t"]*x["distance_nm"]).replace(0,np.nan)
+        ef = (x["co2_t"]*1_000_000)/(denom*1000)
+        k3.metric("Avg gCO₂/t-nm", f"{ef.mean():,.1f}")
+    else:
+        k3.metric("Avg gCO₂/t-nm", "—")
+    x["month"] = x["date"].dt.to_period("M").astype(str)
+    st.plotly_chart(px.bar(x.groupby("month", as_index=False)["co2_t"].sum(), x="month", y="co2_t",
+                           title="CO₂ by month"), config={"responsive": True, "displaylogo": False})
+
+def eexi_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
+    cols = df.columns.tolist()
+    st.caption("Map your EEXI columns (fallback if no DB table provided)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="eexi_vessel")
+    with c2:
+        attained = st.selectbox("Attained EEXI", cols, index=(cols.index("eexi_attained") if "eexi_attained" in cols else 0), key="eexi_attained")
+    with c3:
+        required = st.selectbox("Required EEXI", cols, index=(cols.index("eexi_required") if "eexi_required" in cols else 0), key="eexi_required")
+    return {"vessel":vessel,"attained":attained,"required":required}
+
+def eexi_view_from_df(df: pd.DataFrame, m: Dict[str,str]):
+    x = df.copy()
+    x["attained"] = pd.to_numeric(x[m["attained"]], errors="coerce")
+    x["required"] = pd.to_numeric(x[m["required"]], errors="coerce")
+    x["vessel"] = x[m["vessel"]].astype(str)
+    x["margin_pct"] = (x["required"] - x["attained"]) / x["required"] * 100.0
+    st.dataframe(x[["vessel","attained","required","margin_pct"]].sort_values("margin_pct", ascending=False))
+    st.plotly_chart(px.bar(x, x="vessel", y="margin_pct", title="EEXI margin (%) — positive is compliant"),
+                    config={"responsive": True, "displaylogo": False})
+
+def eexi_view_from_db(url: str, fq: str):
+    df = read_ref_table(url, fq)
+    if df.empty:
+        st.info("EEXI table/view is empty or not found."); return
+    # Expect columns: vessel, attained, required (allow common variants)
+    colmap = {}
+    for want, pats in {
+        "vessel": [r"vessel", r"ship"],
+        "attained": [r"attained", r"actual"],
+        "required": [r"required", r"ref"]
+    }.items():
+        colmap[want] = next((c for c in df.columns if any(re.search(p, c, re.I) for p in pats)), None)
+    if not all(colmap.values()):
+        st.warning("EEXI table found, but columns couldn’t be auto-mapped. Please adjust the DB view to include 'vessel', 'attained', 'required'.")
+        return
+    x = df.rename(columns={colmap["vessel"]:"vessel", colmap["attained"]:"attained", colmap["required"]:"required"}).copy()
+    x["attained"] = pd.to_numeric(x["attained"], errors="coerce")
+    x["required"] = pd.to_numeric(x["required"], errors="coerce")
+    x["margin_pct"] = (x["required"] - x["attained"]) / x["required"] * 100.0
+    st.dataframe(x[["vessel","attained","required","margin_pct"]].sort_values("margin_pct", ascending=False))
+    st.plotly_chart(px.bar(x, x="vessel", y="margin_pct", title="EEXI margin (%) — from DB"),
+                    config={"responsive": True, "displaylogo": False})
+
+def hull_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
+    cols = df.columns.tolist()
+    st.caption("Map your performance columns for hull fouling indicator")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="hull_date")
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="hull_vessel")
+    with c2:
+        speed = st.selectbox("Speed (kt)", cols, index=(cols.index("speed_kt") if "speed_kt" in cols else 0), key="hull_speed")
+        fuel_t = st.selectbox("Fuel per day (t) / Consumption", cols, index=(cols.index("fuel_t") if "fuel_t" in cols else 0), key="hull_fuel")
+    with c3:
+        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="hull_dist")
+        group = st.selectbox("Group baseline by (e.g., draft/route) [optional]", [None]+cols, index=0, key="hull_group")
+    return {"date":date,"vessel":vessel,"speed":speed,"fuel_t":fuel_t,"distance_nm":dist,"group":group or ""}
+
+def hull_indicator(df: pd.DataFrame, m: Dict[str,str]):
+    x = df.copy()
+    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
+    x["vessel"] = x[m["vessel"]].astype(str)
+    x["speed"] = pd.to_numeric(x[m["speed"]], errors="coerce")
+    x["fuel_t"] = pd.to_numeric(x[m["fuel_t"]], errors="coerce")
+    x["distance_nm"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").replace(0,np.nan)
+    x["fuel_per_nm"] = x["fuel_t"] / x["distance_nm"]
+    key_cols = ["vessel"] + ([m["group"]] if m["group"] else [])
+    x = x.sort_values("date")
+    x["rolling_fpnm"] = x.groupby(key_cols)["fuel_per_nm"].transform(lambda s: s.rolling(30, min_periods=5).mean())
+    base = x.groupby(key_cols)["fuel_per_nm"].transform("median")
+    x["degradation_pct"] = (x["rolling_fpnm"] - base) / base * 100.0
+    st.plotly_chart(px.line(x, x="date", y="degradation_pct", color="vessel", title="Hull performance degradation vs baseline (%)"),
+                    config={"responsive": True, "displaylogo": False})
+    thr = st.slider("Alert threshold (%)", 2.0, 20.0, 8.0, step=0.5)
+    alerts = x.groupby("vessel", as_index=False)["degradation_pct"].last()
+    alerts["recommend_cleaning"] = alerts["degradation_pct"] >= thr
+    st.dataframe(alerts.sort_values("degradation_pct", ascending=False))
+
+def ets_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
+    cols = df.columns.tolist()
+    st.caption("Map your ETS columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="ets_vessel")
+        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="ets_date")
+    with c2:
+        co2 = st.selectbox("CO2 (t)", cols, index=(cols.index("co2_t") if "co2_t" in cols else 0), key="ets_co2")
+        voyage_type = st.selectbox("Voyage type (intraEU/extraEU/inbound/outbound)", [None]+cols, index=0, key="ets_type")
+    with c3:
+        price = st.number_input("ETS price (€/tCO₂)", min_value=0.0, value=65.0, step=1.0)
+    return {"vessel":vessel,"date":date,"co2_t":co2,"type":voyage_type or "", "price": price}
+
+def ets_estimator(df: pd.DataFrame, m: Dict[str,str]):
+    x = df.copy()
+    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
+    x["co2_t"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
+    if m["type"]:
+        x["type"] = x[m["type"]].str.lower().fillna("unknown")
+    else:
+        x["type"] = "unknown"
+    year = st.number_input("Compliance year", min_value=2024, max_value=2035, value=pd.Timestamp.today().year, step=1)
+    phase_in = st.slider("Phase-in coverage (%)", 0, 100, 70 if year==2025 else (40 if year==2024 else 100), step=5)
+    intra = st.slider("Intra-EU coverage (%)", 0, 100, 100, step=10)
+    extra = st.slider("Extra-EU (inbound/outbound) coverage (%)", 0, 100, 50, step=10)
+    def coverage(t):
+        if t.startswith("intra"): return intra/100.0
+        if t in ("extraeu","inbound","outbound"): return extra/100.0
+        return 0.0
+    x["covered_t"] = x["co2_t"] * x["type"].map(coverage)
+    x["allowances_t"] = x["covered_t"] * (phase_in/100.0)
+    k1,k2,k3 = st.columns(3)
+    k1.metric("Total CO₂ (t)", f"{x['co2_t'].sum():,.0f}")
+    k2.metric("Covered CO₂ (t)", f"{x['covered_t'].sum():,.0f}")
+    k3.metric("ETS allowances (t)", f"{x['allowances_t'].sum():,.0f}")
+    st.metric("Cost estimate (€)", f"{x['allowances_t'].sum()*m['price']:,.0f}")
+    x["month"] = x["date"].dt.to_period("M").astype(str)
+    st.plotly_chart(px.bar(x.groupby("month", as_index=False)["allowances_t"].sum(), x="month", y="allowances_t",
+                           title="ETS allowances by month (t)"), config={"responsive": True, "displaylogo": False})
+
+def fueleu_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
+    cols = df.columns.tolist()
+    st.caption("Map your FuelEU columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="fe_vessel")
+        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="fe_date")
+    with c2:
+        energy_mj = st.selectbox("Energy used (MJ) [optional]", [None]+cols, index=0, key="fe_mj")
+        co2eq = st.selectbox("CO₂e (kg) [optional]", [None]+cols, index=0, key="fe_co2eq")
+    with c3:
+        fuel_t = st.selectbox("Fuel (t) [optional]", [None]+cols, index=(cols.index("fuel_t")+1 if "fuel_t" in cols else 0), key="fe_fuel_t")
+        fuel_type = st.selectbox("Fuel type col [optional]", [None]+cols, index=(cols.index("fuel_type")+1 if "fuel_type" in cols else 0), key="fe_fueltype")
+    target = st.number_input("Target GHG intensity (gCO₂e/MJ)", min_value=0.0, value=91.0, step=0.1)
+    return {"vessel":vessel,"date":date,"energy_mj":energy_mj or "","co2eq":co2eq or "","fuel_t":fuel_t or "","fuel_type":fuel_type or "","target":target}
+
+def fueleu_view(df: pd.DataFrame, m: Dict[str,str], target_override: Optional[float] = None):
+    x = df.copy()
+    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
+    if m["energy_mj"] and m["co2eq"]:
+        e = pd.to_numeric(x[m["energy_mj"]], errors="coerce").fillna(np.nan)
+        co2e = pd.to_numeric(x[m["co2eq"]], errors="coerce").fillna(np.nan)
+        x["intensity"] = (co2e*1000)/e
+    elif m["fuel_t"]:
+        LHV_MJ_PER_T = {"HFO": 40_400, "MGO": 42_700, "LNG": 49_500}
+        ft = x[m["fuel_type"]].map(LHV_MJ_PER_T).fillna(40_000) if m["fuel_type"] else 40_000
+        energy = pd.to_numeric(x[m["fuel_t"]], errors="coerce").fillna(0.0) * ft
+        co2e = co2_from_fuel(x, m["fuel_t"], m["fuel_type"] or None) * 1000
+        x["intensity"] = co2e / energy.replace(0,np.nan)
+    else:
+        x["intensity"] = np.nan
+    x["month"] = x["date"].dt.to_period("M").astype(str)
+    grp = x.groupby("month", as_index=False)["intensity"].mean()
+    tgt = target_override if target_override is not None else m["target"]
+    line = px.line(grp, x="month", y="intensity", markers=True, title="GHG intensity (gCO₂e/MJ)")
+    line.add_hline(y=tgt, line_dash="dot", annotation_text=f"Target {tgt} g/MJ")
+    st.plotly_chart(line, config={"responsive": True, "displaylogo": False})
+    st.dataframe(x[["vessel","date","intensity"]].sort_values("date"))
 
 # -------------------------- Dashboard viewer --------------------------
 
@@ -497,297 +815,13 @@ def section_dashboard(url: str, main_df: pd.DataFrame):
                     else: df = df[df[col] == val]
         render_chart(df, t)
 
-# -------------------------- Environmental: helpers --------------------------
-
-# Basic TTW CO2 emission factors (tCO2 per tonne of fuel) — placeholder values.
-EF_T_CO2_PER_T_FUEL = {
-    "HFO": 3.114, "LFO": 3.151, "MGO": 3.206, "MDO": 3.206, "LNG": 2.750, "LPG": 3.000,
-}
-
-def co2_from_fuel(df: pd.DataFrame, fuel_t_col: str, fuel_type_col: Optional[str]) -> pd.Series:
-    if fuel_type_col and fuel_type_col in df.columns:
-        ef = df[fuel_type_col].map(EF_T_CO2_PER_T_FUEL).fillna(3.114)  # default HFO
-        return df[fuel_t_col].fillna(0) * ef
-    return df[fuel_t_col].fillna(0) * 3.114  # default
-
-def cii_mapper_ui(df: pd.DataFrame) -> Dict[str, str]:
-    cols = df.columns.tolist()
-    st.caption("Map your CII columns")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="cii_vessel")
-        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="cii_date")
-    with c2:
-        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="cii_dist")
-        dwt = st.selectbox("DWT / Capacity", cols, index=(cols.index("dwt") if "dwt" in cols else 0), key="cii_dwt")
-    with c3:
-        co2 = st.selectbox("CO2 (t) [optional]", [None]+cols, index=(cols.index("co2_t")+1 if "co2_t" in cols else 0), key="cii_co2")
-        fuel_t = st.selectbox("Fuel (t) [optional]", [None]+cols, index=(cols.index("fuel_t")+1 if "fuel_t" in cols else 0), key="cii_fuel_t")
-    ship_type = st.selectbox("Ship type", [c for c in ["LNG","Tanker","Bulkcarrier","Container","Other"]], index=0, key="cii_shiptype")
-    fuel_type = st.selectbox("Fuel type col [optional]", [None]+cols, index=(cols.index("fuel_type")+1 if "fuel_type" in cols else 0), key="cii_fueltype")
-    return {
-        "vessel": vessel, "date": date, "distance_nm": dist, "dwt": dwt,
-        "co2_t": co2 or "", "fuel_t": fuel_t or "", "fuel_type": fuel_type or "", "ship_type": ship_type
-    }
-
-def compute_aer(df: pd.DataFrame, m: Dict[str,str]) -> pd.DataFrame:
-    x = df.copy()
-    # CO2 selection
-    if m["co2_t"]:
-        x["co2_t_calc"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
-    elif m["fuel_t"]:
-        x["co2_t_calc"] = co2_from_fuel(x, m["fuel_t"], m["fuel_type"] or None)
-    else:
-        x["co2_t_calc"] = 0.0
-    # base fields
-    x["distance_nm_calc"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").fillna(0.0)
-    x["dwt_calc"] = pd.to_numeric(x[m["dwt"]], errors="coerce").fillna(np.nan)
-    x["vessel_calc"] = x[m["vessel"]].astype(str)
-    x["date_calc"] = pd.to_datetime(x[m["date"]], errors="coerce")
-    # AER gCO2 per dwt-nm
-    denom = (x["dwt_calc"] * x["distance_nm_calc"]).replace(0, np.nan)
-    x["aer_g_per_dwt_nm"] = (x["co2_t_calc"] * 1_000_000) / (denom * 1000)  # 1 t = 1e6 g ; 1 dwt ~ 1 t
-    # tidy
-    return x[["vessel_calc","date_calc","dwt_calc","distance_nm_calc","co2_t_calc","aer_g_per_dwt_nm"]].rename(
-        columns={"vessel_calc":"vessel","date_calc":"date","dwt_calc":"dwt","distance_nm_calc":"distance_nm","co2_t_calc":"co2_t"}
-    )
-
-def cii_band_data_ui(url: str) -> Optional[pd.DataFrame]:
-    st.caption("CII bands source (optional)")
-    ups = st.file_uploader("Upload CSV with columns: ship_type,year,dwt_min,dwt_max,A,B,C,D,E (AER thresholds gCO2/dwt-nm)", type=["csv"], key="cii_bands_up")
-    if ups is not None:
-        try:
-            df = pd.read_csv(ups)
-            st.success("Loaded bands CSV.")
-            return df
-        except Exception as e:
-            st.error(f"Bad CSV: {e}")
-    # Future: read from DB view here if you maintain one (e.g., vw_cii_bands)
-    return None
-
-def fleet_cii_view(aer_df: pd.DataFrame, ship_type: str, bands: Optional[pd.DataFrame]):
-    st.subheader("Fleet view")
-    min_date, max_date = st.date_input("Date range", value=(aer_df["date"].min(), aer_df["date"].max()), format="YYYY-MM-DD")
-    mask = (aer_df["date"] >= pd.to_datetime(min_date)) & (aer_df["date"] <= pd.to_datetime(max_date))
-    g = aer_df.loc[mask].groupby("vessel", as_index=False).agg(
-        aer=("aer_g_per_dwt_nm","mean"),
-        dwt=("dwt","median")
-    )
-    fig = px.scatter(g, x="dwt", y="aer", hover_name="vessel", title="AER vs DWT (mean over selected range)")
-    if bands is not None and not bands.empty:
-        yr = st.number_input("Band year", value=int(pd.Timestamp.today().year), step=1)
-        b = bands[(bands["ship_type"].str.lower()==ship_type.lower()) & (bands["year"]==int(yr))]
-        # draw shaded bands
-        for _, row in b.iterrows():
-            # Expect one row per dwt range with A..E thresholds; draw horizontal-ish steps with rectangles
-            # For simplicity, show thresholds as lines at mid DWT band
-            pass
-        st.caption("Bands CSV loaded — overlay not drawn to avoid wrong assumptions; plug your visuals as desired.")
-    st.plotly_chart(fig, config={"responsive": True, "displaylogo": False})
-
-def vessel_cii_view(aer_df: pd.DataFrame):
-    st.subheader("Vessel detail")
-    vessels = sorted(aer_df["vessel"].dropna().unique().tolist())
-    v = st.selectbox("Vessel", vessels, index=0)
-    mode = st.radio("View by", ["Voyage (requires voyage_id)", "Monthly", "Yearly"], horizontal=True)
-    dfv = aer_df[aer_df["vessel"]==v].copy()
-    if mode.startswith("Voyage") and "voyage_id" in dfv.columns:
-        grp = dfv.groupby("voyage_id", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
-        fig = px.bar(grp, x="voyage_id", y="aer", title=f"{v} — AER by voyage")
-    elif mode == "Monthly":
-        dfv["month"] = dfv["date"].dt.to_period("M").astype(str)
-        grp = dfv.groupby("month", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
-        fig = px.line(grp, x="month", y="aer", markers=True, title=f"{v} — AER monthly")
-    else:
-        dfv["year"] = dfv["date"].dt.year
-        grp = dfv.groupby("year", as_index=False).agg(aer=("aer_g_per_dwt_nm","mean"))
-        fig = px.line(grp, x="year", y="aer", markers=True, title=f"{v} — AER yearly")
-    st.plotly_chart(fig, config={"responsive": True, "displaylogo": False})
-
-def mrv_mapper_ui(df: pd.DataFrame) -> Dict[str, str]:
-    cols = df.columns.tolist()
-    st.caption("Map your MRV columns")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="mrv_vessel")
-        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="mrv_date")
-    with c2:
-        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="mrv_dist")
-        cargo = st.selectbox("Cargo carried (t) [optional]", [None]+cols, index=0, key="mrv_cargo")
-    with c3:
-        co2 = st.selectbox("CO2 (t)", cols, index=(cols.index("co2_t") if "co2_t" in cols else 0), key="mrv_co2")
-        port = st.selectbox("Port / Area [optional]", [None]+cols, index=0, key="mrv_port")
-    return {"vessel":vessel,"date":date,"distance_nm":dist,"co2_t":co2,"cargo_t":cargo or "","port":port or ""}
-
-def mrv_kpis_and_plots(df: pd.DataFrame, m: Dict[str,str]):
-    x = df.copy()
-    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
-    x["co2_t"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
-    x["distance_nm"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").fillna(0.0)
-    if m["cargo_t"]:
-        x["cargo_t"] = pd.to_numeric(x[m["cargo_t"]], errors="coerce").fillna(np.nan)
-    # KPIs
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Total CO₂ (t)", f"{x['co2_t'].sum():,.0f}")
-    k2.metric("Total distance (nm)", f"{x['distance_nm'].sum():,.0f}")
-    if m["cargo_t"]:
-        denom = (x["cargo_t"]*x["distance_nm"]).replace(0,np.nan)
-        ef = (x["co2_t"]*1_000_000)/(denom*1000)  # g CO2 / t-nm
-        k3.metric("Avg gCO₂/t-nm", f"{ef.mean():,.1f}")
-    else:
-        k3.metric("Avg gCO₂/t-nm", "—")
-    # Charts
-    x["month"] = x["date"].dt.to_period("M").astype(str)
-    st.plotly_chart(px.bar(x.groupby("month", as_index=False)["co2_t"].sum(), x="month", y="co2_t",
-                           title="CO₂ by month"), config={"responsive": True, "displaylogo": False})
-
-def eexi_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
-    cols = df.columns.tolist()
-    st.caption("Map your EEXI columns (static per vessel)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="eexi_vessel")
-    with c2:
-        attained = st.selectbox("Attained EEXI", cols, index=(cols.index("eexi_attained") if "eexi_attained" in cols else 0), key="eexi_attained")
-    with c3:
-        required = st.selectbox("Required EEXI", cols, index=(cols.index("eexi_required") if "eexi_required" in cols else 0), key="eexi_required")
-    return {"vessel":vessel,"attained":attained,"required":required}
-
-def eexi_view(df: pd.DataFrame, m: Dict[str,str]):
-    x = df.copy()
-    x["attained"] = pd.to_numeric(x[m["attained"]], errors="coerce")
-    x["required"] = pd.to_numeric(x[m["required"]], errors="coerce")
-    x["vessel"] = x[m["vessel"]].astype(str)
-    x["margin_pct"] = (x["required"] - x["attained"]) / x["required"] * 100.0
-    st.dataframe(x[["vessel","attained","required","margin_pct"]].sort_values("margin_pct", ascending=False))
-    st.plotly_chart(px.bar(x, x="vessel", y="margin_pct", title="EEXI margin (%) — positive is compliant"), config={"responsive": True, "displaylogo": False})
-
-def hull_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
-    cols = df.columns.tolist()
-    st.caption("Map your performance columns for hull fouling indicator")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="hull_date")
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="hull_vessel")
-    with c2:
-        speed = st.selectbox("Speed (kt)", cols, index=(cols.index("speed_kt") if "speed_kt" in cols else 0), key="hull_speed")
-        fuel_t = st.selectbox("Fuel per day (t) / Consumption", cols, index=(cols.index("fuel_t") if "fuel_t" in cols else 0), key="hull_fuel")
-    with c3:
-        dist = st.selectbox("Distance (nm)", cols, index=(cols.index("distance_nm") if "distance_nm" in cols else 0), key="hull_dist")
-        group = st.selectbox("Group baseline by (e.g., draft/route) [optional]", [None]+cols, index=0, key="hull_group")
-    return {"date":date,"vessel":vessel,"speed":speed,"fuel_t":fuel_t,"distance_nm":dist,"group":group or ""}
-
-def hull_indicator(df: pd.DataFrame, m: Dict[str,str]):
-    x = df.copy()
-    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
-    x["vessel"] = x[m["vessel"]].astype(str)
-    x["speed"] = pd.to_numeric(x[m["speed"]], errors="coerce")
-    x["fuel_t"] = pd.to_numeric(x[m["fuel_t"]], errors="coerce")
-    x["distance_nm"] = pd.to_numeric(x[m["distance_nm"]], errors="coerce").replace(0,np.nan)
-    x["fuel_per_nm"] = x["fuel_t"] / x["distance_nm"]
-    key_cols = ["vessel"] + ([m["group"]] if m["group"] else [])
-    # rolling 30-day moving average per vessel/group
-    x = x.sort_values("date")
-    x["rolling_fpnm"] = x.groupby(key_cols)["fuel_per_nm"].transform(lambda s: s.rolling(30, min_periods=5).mean())
-    base = x.groupby(key_cols, as_index=False)["fuel_per_nm"].transform("median")
-    x["degradation_pct"] = (x["rolling_fpnm"] - base) / base * 100.0
-    st.plotly_chart(px.line(x, x="date", y="degradation_pct", color="vessel", title="Hull performance degradation vs baseline (%)"),
-                    config={"responsive": True, "displaylogo": False})
-    thr = st.slider("Alert threshold (%)", 2.0, 20.0, 8.0, step=0.5)
-    alerts = x.groupby("vessel", as_index=False)["degradation_pct"].last()
-    alerts["recommend_cleaning"] = alerts["degradation_pct"] >= thr
-    st.dataframe(alerts.sort_values("degradation_pct", ascending=False))
-
-def ets_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
-    cols = df.columns.tolist()
-    st.caption("Map your ETS columns")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="ets_vessel")
-        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="ets_date")
-    with c2:
-        co2 = st.selectbox("CO2 (t)", cols, index=(cols.index("co2_t") if "co2_t" in cols else 0), key="ets_co2")
-        voyage_type = st.selectbox("Voyage type (intraEU/extraEU/inbound/outbound)", [None]+cols, index=0, key="ets_type")
-    with c3:
-        price = st.number_input("ETS price (€/tCO2)", min_value=0.0, value=65.0, step=1.0)
-    return {"vessel":vessel,"date":date,"co2_t":co2,"type":voyage_type or "", "price": price}
-
-def ets_estimator(df: pd.DataFrame, m: Dict[str,str]):
-    x = df.copy()
-    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
-    x["co2_t"] = pd.to_numeric(x[m["co2_t"]], errors="coerce").fillna(0.0)
-    if m["type"]:
-        x["type"] = x[m["type"]].str.lower().fillna("unknown")
-    else:
-        x["type"] = "unknown"
-    year = st.number_input("Compliance year", min_value=2024, max_value=2035, value=pd.Timestamp.today().year, step=1)
-    # Phase-in factor — user control (official values may differ over time)
-    phase_in = st.slider("Phase-in coverage (%)", 0, 100, 70 if year==2025 else (40 if year==2024 else 100), step=5)
-    # Voyage share weights
-    intra = st.slider("Intra-EU coverage (%)", 0, 100, 100, step=10)
-    extra = st.slider("Extra-EU (inbound/outbound) coverage (%)", 0, 100, 50, step=10)
-    def coverage(t):
-        if t.startswith("intra"): return intra/100.0
-        if t in ("extraeu","inbound","outbound"): return extra/100.0
-        return 0.0
-    x["covered_t"] = x["co2_t"] * x["type"].map(coverage)
-    x["allowances_t"] = x["covered_t"] * (phase_in/100.0)
-    k1,k2,k3 = st.columns(3)
-    k1.metric("Total CO₂ (t)", f"{x['co2_t'].sum():,.0f}")
-    k2.metric("Covered CO₂ (t)", f"{x['covered_t'].sum():,.0f}")
-    k3.metric("ETS allowances (t)", f"{x['allowances_t'].sum():,.0f}")
-    st.metric("Cost estimate (€)", f"{x['allowances_t'].sum()*m['price']:,.0f}")
-    x["month"] = x["date"].dt.to_period("M").astype(str)
-    st.plotly_chart(px.bar(x.groupby("month", as_index=False)["allowances_t"].sum(), x="month", y="allowances_t",
-                           title="ETS allowances by month (t)"), config={"responsive": True, "displaylogo": False})
-
-def fueleu_mapper_ui(df: pd.DataFrame) -> Dict[str,str]:
-    cols = df.columns.tolist()
-    st.caption("Map your FuelEU columns")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        vessel = st.selectbox("Vessel", cols, index=(cols.index("vessel") if "vessel" in cols else 0), key="fe_vessel")
-        date = st.selectbox("Date", cols, index=(cols.index("date") if "date" in cols else 0), key="fe_date")
-    with c2:
-        energy_mj = st.selectbox("Energy used (MJ) [optional]", [None]+cols, index=0, key="fe_mj")
-        co2eq = st.selectbox("CO₂e (kg) [optional]", [None]+cols, index=0, key="fe_co2eq")
-    with c3:
-        fuel_t = st.selectbox("Fuel (t) [optional]", [None]+cols, index=(cols.index("fuel_t")+1 if "fuel_t" in cols else 0), key="fe_fuel_t")
-        fuel_type = st.selectbox("Fuel type col [optional]", [None]+cols, index=(cols.index("fuel_type")+1 if "fuel_type" in cols else 0), key="fe_fueltype")
-    target = st.number_input("Target GHG intensity (gCO₂e/MJ)", min_value=0.0, value=91.0, step=0.1)
-    return {"vessel":vessel,"date":date,"energy_mj":energy_mj or "","co2eq":co2eq or "","fuel_t":fuel_t or "","fuel_type":fuel_type or "","target":target}
-
-def fueleu_view(df: pd.DataFrame, m: Dict[str,str]):
-    x = df.copy()
-    x["date"] = pd.to_datetime(x[m["date"]], errors="coerce")
-    # compute intensity
-    if m["energy_mj"] and m["co2eq"]:
-        e = pd.to_numeric(x[m["energy_mj"]], errors="coerce").fillna(np.nan)
-        co2e = pd.to_numeric(x[m["co2eq"]], errors="coerce").fillna(np.nan)
-        x["intensity"] = (co2e*1000)/e  # g/MJ if co2e is kg
-    elif m["fuel_t"]:
-        # rough proxy: convert fuel_t -> energy via LHV, fuel_t -> CO2eq via EF (assumes TTW)
-        LHV_MJ_PER_T = {"HFO": 40_400, "MGO": 42_700, "LNG": 49_500}
-        ft = x[m["fuel_type"]].map(LHV_MJ_PER_T).fillna(40_000) if m["fuel_type"] else 40_000
-        energy = pd.to_numeric(x[m["fuel_t"]], errors="coerce").fillna(0.0) * ft
-        co2e = co2_from_fuel(x, m["fuel_t"], m["fuel_type"] or None) * 1000  # t -> kg
-        x["intensity"] = co2e / energy.replace(0,np.nan)
-    else:
-        x["intensity"] = np.nan
-    x["month"] = x["date"].dt.to_period("M").astype(str)
-    grp = x.groupby("month", as_index=False)["intensity"].mean()
-    line = px.line(grp, x="month", y="intensity", markers=True, title="GHG intensity (gCO₂e/MJ)")
-    line.add_hline(y=m["target"], line_dash="dot", annotation_text=f"Target {m['target']} g/MJ")
-    st.plotly_chart(line, config={"responsive": True, "displaylogo": False})
-    st.dataframe(x[["vessel","date","intensity"]].sort_values("date"))
-
 # -------------------------- Main --------------------------
 
 def main():
     st.set_page_config(page_title="Helix Commercial Analyzer — Environmental", layout="wide")
 
     config = load_config(CONFIG_PATH)
-    profile, url, _ = sidebar_controls(config)
+    profile, url, state = sidebar_controls(config)
 
     # Reset when server/DB changes
     cur_key = connection_key(profile.name, profile.host, profile.database)
@@ -797,7 +831,7 @@ def main():
         st.session_state["data_source"] = "Demo dataset"
         st.cache_data.clear()
 
-    # DATA VIEW
+    # DATA
     st.header("Data")
     df = st.session_state.get("last_df", demo_dataset())
     source_label = st.session_state.get("data_source","Demo dataset")
@@ -808,7 +842,7 @@ def main():
     df_filtered = apply_filters(df_filtered, dt_cols)
     st.dataframe(df_filtered)
 
-    # ENVIRONMENTAL TABS
+    # ENVIRONMENTAL
     st.header("Environmental")
     tab_cii, tab_mrv, tab_eexi, tab_hull, tab_ets, tab_fueleu = st.tabs(["CII","EU MRV","EEXI","Hull fouling","EU ETS","FuelEU"])
 
@@ -818,10 +852,14 @@ def main():
         else:
             m = cii_mapper_ui(df_filtered)
             aer_df = compute_aer(df_filtered, m)
-            bands = cii_band_data_ui(url)  # optional CSV
+            # CII bands from DB if provided
+            bands_ref = state["refs"].get("cii")
+            bands_df = read_ref_table(url, bands_ref) if bands_ref else None
+            if bands_df is not None and not bands_df.empty:
+                st.success(f"Using bands from: {bands_ref}")
             st.markdown("---")
             colA, colB = st.columns(2)
-            with colA: fleet_cii_view(aer_df, m["ship_type"], bands)
+            with colA: fleet_cii_view(aer_df, m["ship_type"], bands_df)
             with colB: vessel_cii_view(aer_df)
 
     with tab_mrv:
@@ -834,7 +872,12 @@ def main():
         if df_filtered.empty:
             st.info("No data loaded.")
         else:
-            m = eexi_mapper_ui(df_filtered); st.markdown("---"); eexi_view(df_filtered, m)
+            eexi_ref = state["refs"].get("eexi")
+            if eexi_ref:
+                st.success(f"Using EEXI from: {eexi_ref}")
+                eexi_view_from_db(url, eexi_ref)
+            else:
+                m = eexi_mapper_ui(df_filtered); st.markdown("---"); eexi_view_from_df(df_filtered, m)
 
     with tab_hull:
         if df_filtered.empty:
@@ -852,9 +895,26 @@ def main():
         if df_filtered.empty:
             st.info("No data loaded.")
         else:
-            m = fueleu_mapper_ui(df_filtered); st.markdown("---"); fueleu_view(df_filtered, m)
+            fe_ref = state["refs"].get("fueleu")
+            target_override = None
+            if fe_ref:
+                df_tgt = read_ref_table(url, fe_ref)
+                # Expect columns: year, target_g_per_mj OR a single row with 'target'
+                ycol = next((c for c in df_tgt.columns if re.search(r"year", c, re.I)), None)
+                tcol = next((c for c in df_tgt.columns if re.search(r"(target.*g)|g.*per.*mj|intensity", c, re.I)), None)
+                if tcol is not None:
+                    if ycol:
+                        year = st.number_input("Target year", min_value=2020, max_value=2035, value=pd.Timestamp.today().year, step=1)
+                        row = df_tgt.loc[df_tgt[ycol]==year]
+                        if not row.empty:
+                            target_override = float(row.iloc[0][tcol])
+                            st.success(f"FuelEU target {target_override} g/MJ from {fe_ref} for {year}")
+                    else:
+                        target_override = float(df_tgt.iloc[0][tcol])
+                        st.success(f"FuelEU target {target_override} g/MJ from {fe_ref}")
+            m = fueleu_mapper_ui(df_filtered); st.markdown("---"); fueleu_view(df_filtered, m, target_override)
 
-    # DASHBOARD VIEWER (optional)
+    # DASHBOARD VIEWER
     section_dashboard(url, df_filtered)
 
 if __name__ == "__main__":
