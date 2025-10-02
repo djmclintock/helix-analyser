@@ -8,3 +8,4 @@ pyyaml
 python-dateutil
 python-tds
 sqlalchemy-pytds
+certifi
