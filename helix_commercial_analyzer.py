@@ -9,7 +9,7 @@ Helix Commercial Analyzer — Streamlit MVP
     1) Secrets UI (preferred), or
     2) .streamlit/secrets.toml in the repo (fallback), else
     3) helix_config.yaml
-- FIX: Cache functions now take URL strings (hashable) instead of Engine objects.
+- TLS for pytds: uses certifi CA bundle via ?cafile=... (required for encrypted servers)
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ from urllib.parse import quote_plus
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+
+# NEW: certifi gives us a portable CA bundle path
+import certifi
 
 # Optional YAML for local dev config
 try:
@@ -185,15 +188,22 @@ def load_config(path: str) -> AppConfig:
 
 def get_sqlalchemy_url(p: ServerProfile) -> str:
     user = (p.username or "").strip()
-    pwd = (p.password or "").strip()
+    pwd  = (p.password or "").strip()
     host = (p.host or "").strip()
-    db = (p.database or "").strip()
+    db   = (p.database or "").strip()
     if not (host and db):
         return ""
     if DBAPI == "pytds":
+        # TLS: pytds enables encryption only when 'cafile' is supplied.
+        # Use certifi to provide a CA bundle path that validates Azure's cert chain.
         if not (user and pwd):
             return ""
-        return f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}@{host}:1433/{db}?encrypt=yes"
+        cafile = certifi.where()
+        # validate_host defaults to True; include explicitly for clarity.
+        return (
+            f"mssql+pytds://{quote_plus(user)}:{quote_plus(pwd)}"
+            f"@{host}:1433/{db}?cafile={quote_plus(cafile)}&validate_host=true"
+        )
     else:
         if not (user and pwd):
             return ""
@@ -252,9 +262,6 @@ def run_sql(profile: ServerProfile, sql: str, params: Optional[Dict[str, Any]] =
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_comm_vw_objects(url: str) -> pd.DataFrame:
-    """
-    Cached by URL (hashable). Internally uses the cached Engine.
-    """
     if not url:
         return pd.DataFrame(columns=["schema_name", "object_name", "object_type"])
     engine = get_engine_for_url(url)
@@ -296,9 +303,6 @@ def list_comm_vw_objects(url: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def preview_object(url: str, schema: str, name: str, limit: int) -> pd.DataFrame:
-    """
-    Cached by URL + identifiers (all hashable). Internally uses the cached Engine.
-    """
     if not url:
         return pd.DataFrame()
     engine = get_engine_for_url(url)
@@ -442,7 +446,6 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[E
     with st.sidebar.expander("Profiles from YAML"):
         st.write(", ".join(st.session_state.get("profiles_from_yaml", [])) or "—")
 
-    # show field presence (safe; no values)
     st.sidebar.write(
         "Fields present — "
         f"Host: {'✅' if profile.host else '—'} · "
@@ -453,6 +456,9 @@ def sidebar_controls(config: AppConfig) -> Tuple[ServerProfile, bool, Optional[E
 
     url = get_sqlalchemy_url(profile)
     st.sidebar.write(f"Credentials present: **{'Yes' if bool(url) else 'No'}**")
+    if DBAPI == "pytds" and url:
+        st.sidebar.caption(f"TLS (pytds) CA: `{certifi.where()}`")
+
     engine = get_engine_for_url(url) if url else None
     ok, err = try_connect(engine)
     if ok:
@@ -601,7 +607,7 @@ def main():
         st.session_state.pop("last_sql", None)
         st.cache_data.clear()
 
-    # COMM/VW picker (now URL-based)
+    # COMM/VW picker (URL-based)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Choose COMM/VW table/view")
     objs = list_comm_vw_objects(url)
