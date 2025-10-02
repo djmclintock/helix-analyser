@@ -1,11 +1,18 @@
-﻿streamlit
+streamlit
 pandas
 numpy
 plotly
 sqlalchemy>=2.0
-pydantic
+pydantic>=2
 pyyaml
 python-dateutil
+
+# MSSQL (pure Python on Streamlit Cloud)
 python-tds
 sqlalchemy-pytds
+
+# TLS stack required by python-tds
 certifi
+cryptography
+pyOpenSSL
+service-identity
