@@ -1,16 +1,43 @@
+# helix-analyser/cii_dummy_data.py
+from __future__ import annotations
 import pandas as pd
+from datetime import date
 
-def get_dummy_cii_data():
-    data = [
-        # vessel, type, voyage, from, to, distance nm, fuel t, CO2 t, CII, rating
-        ["ShipNet LNG",       "LNG Carrier",  "LNG001", "2025-01-10", "2025-01-20", 12000, 3000, 9342, 15.6, "C"],
-        ["ShipNet Bulk",      "Bulk Carrier", "BULK01", "2025-02-01", "2025-02-15",  8000, 1500, 4671, 14.5, "B"],
-        ["ShipNet Container", "Container",    "CONT01", "2025-03-05", "2025-03-12",  6000, 1200, 3798, 17.9, "D"],
-        ["ShipNet Gas",       "Gas Carrier",  "GAS01",  "2025-01-25", "2025-02-03",  5000, 1100, 3480, 18.7, "D"],
-        ["ShipNet Tanker",    "Tanker",       "TNK01",  "2025-02-20", "2025-02-28",  7000, 1600, 4982, 20.3, "E"],
+def get_dummy_vessels() -> pd.DataFrame:
+    """
+    Five standard vessels with typical particulars for demo calculations.
+    Units:
+      - DWT: tonnes
+      - Type: high-level ship type
+    """
+    rows = [
+        # name,             type,           DWT
+        ("ShipNet LNG",      "LNG Carrier",  100_000),
+        ("ShipNet Container","Container",     80_000),
+        ("ShipNet Gas",      "Gas Carrier",   55_000),
+        ("ShipNet Bulk",     "Bulk Carrier",  82_000),
+        ("ShipNet Tanker",   "Tanker",       110_000),
     ]
-    df = pd.DataFrame(data, columns=[
-        "Vessel", "Type", "Voyage", "DateFrom", "DateTo",
-        "Distance_nm", "Fuel_t", "CO2_t", "CII_gCO2_DWTnm", "Rating"
+    return pd.DataFrame(rows, columns=["Vessel", "Type", "DWT"])
+
+def get_dummy_voyages() -> pd.DataFrame:
+    """
+    Minimal per-voyage demo data.
+    Distance/Fuel are rough placeholders to drive the UI.
+    CII is NOT precomputed here; your page can compute/override if needed.
+    """
+    rows = [
+        # Vessel,            Voyage,   DateFrom,     DateTo,       Distance_nm, HFO_t, MDO_t, LNG_t
+        ("ShipNet LNG",       "LNG001", date(2025,1,10), date(2025,1,20), 12000,  0.0,  0.0, 3000.0),
+        ("ShipNet Bulk",      "BULK01", date(2025,2, 1), date(2025,2,15),  8000,1500.0,  50.0,   0.0),
+        ("ShipNet Container", "CONT01", date(2025,3, 5), date(2025,3,12),  6000,1200.0,  80.0,   0.0),
+        ("ShipNet Gas",       "GAS01",  date(2025,1,25), date(2025,2, 3),  5000, 900.0,  60.0, 150.0),
+        ("ShipNet Tanker",    "TNK01",  date(2025,2,20), date(2025,2,28),  7000,1600.0,  70.0,   0.0),
+    ]
+    df = pd.DataFrame(rows, columns=[
+        "Vessel","Voyage","DateFrom","DateTo","Distance_nm","HFO_t","MDO_t","LNG_t"
     ])
+    # simple placeholder for CO2 and attained CII (gCO2/DWT·nm) using rough CFs
+    CF = {"HFO_t": 3.114, "MDO_t": 3.206, "LNG_t": 2.750}  # tCO2 per t fuel
+    df["CO2_t"] = df["HFO_t"]*CF["HFO_t"] + df["MDO_t"]*CF["MDO_t"] + df["LNG_t"]*CF["LNG_t"]
     return df
