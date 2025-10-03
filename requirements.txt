@@ -6,6 +6,7 @@ sqlalchemy>=2.0
 pydantic>=2
 pyyaml
 python-dateutil
+matplotlib
 
 # MSSQL (pure Python on Streamlit Cloud)
 python-tds
