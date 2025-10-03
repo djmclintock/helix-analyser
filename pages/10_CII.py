@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from helix_analyser.cii_dummy_data import get_dummy_cii_data
+from cii_dummy_data import get_dummy_vessels, get_dummy_voyages
 
 st.set_page_config(page_title="CII", layout="wide")
 st.title("Carbon Intensity Indicator (CII)")
