@@ -1,6 +1,9 @@
 # helix-analyser/pages/10_CII.py
 import streamlit as st
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
 from datetime import date
 from cii_dummy_data import get_dummy_vessels, get_dummy_voyages
 
@@ -30,13 +33,86 @@ def simple_rating(x: float) -> str:
 df["Rating"] = df["CII_gCO2_DWTnm"].apply(simple_rating)
 
 # ---------------------------
-# Fleet CII "Bands" view (placeholder)
+# Fleet CII Bands view (with colored A–E bands + labels)
 # ---------------------------
 st.subheader("CII Bands — Fleet view")
-# For now: scatter of CII by vessel (we'll overlay A–E bands when reference sheet is wired)
+st.caption("Demo view with dummy data — bands use the page's temporary thresholds (A≤13, B≤16, C≤19, D≤22, else E).")
+
+# Average per vessel point
 fleet_point = df.groupby(["Vessel","Type","DWT"], as_index=False)["CII_gCO2_DWTnm"].mean()
-st.caption("Demo view with dummy data — real IMO bands will appear once reference tables are connected.")
-st.scatter_chart(fleet_point, x="DWT", y="CII_gCO2_DWTnm")
+
+# Ensure ratings exist for coloring
+def simple_rating(x: float) -> str:
+    if x <= 13: return "A"
+    if x <= 16: return "B"
+    if x <= 19: return "C"
+    if x <= 22: return "D"
+    return "E"
+fleet_point["Rating"] = fleet_point["CII_gCO2_DWTnm"].apply(simple_rating)
+
+# Colors per rating (you can tweak)
+color_map = {
+    "A": "#2ecc71",   # green
+    "B": "#7fdb6a",   # light green
+    "C": "#f1c40f",   # yellow
+    "D": "#e67e22",   # orange
+    "E": "#e74c3c",   # red
+}
+
+# Build base scatter with labels
+fig = px.scatter(
+    fleet_point,
+    x="DWT",
+    y="CII_gCO2_DWTnm",
+    color="Rating",
+    color_discrete_map=color_map,
+    hover_data={"Vessel": True, "Type": True, "DWT": ":,", "CII_gCO2_DWTnm": ":.2f"},
+    text="Vessel",  # name tags beside dots
+)
+
+# Nudge labels and style
+fig.update_traces(textposition="top center", marker=dict(size=10, line=dict(width=1, color="rgba(0,0,0,0.4)")))
+
+# Compute band rectangles (y0/y1) and x-span
+x_min = max(0, float(fleet_point["DWT"].min()*0.9))
+x_max = float(fleet_point["DWT"].max()*1.05)
+y_vals = fleet_point["CII_gCO2_DWTnm"]
+y_max = float(y_vals.max()*1.2 if len(y_vals) else 25.0)
+
+bands = [
+    ("A", 0.0, 13.0,  "rgba(46, 204, 113, 0.10)"),
+    ("B", 13.0, 16.0, "rgba(127, 219, 106, 0.10)"),
+    ("C", 16.0, 19.0, "rgba(241, 196, 15,  0.10)"),
+    ("D", 19.0, 22.0, "rgba(230, 126, 34,  0.10)"),
+    ("E", 22.0, y_max,"rgba(231, 76,  60,  0.10)"),
+]
+
+shapes = []
+annotations = []
+for band_name, y0, y1, rgba in bands:
+    shapes.append(dict(
+        type="rect", xref="x", yref="y",
+        x0=x_min, x1=x_max, y0=y0, y1=y1,
+        fillcolor=rgba, layer="below", line=dict(width=0),
+    ))
+    annotations.append(dict(
+        x=x_max, y=(y0+y1)/2, xref="x", yref="y",
+        text=band_name, showarrow=False, xanchor="right",
+        font=dict(size=12, color="rgba(0,0,0,0.55)")
+    ))
+
+fig.update_layout(
+    shapes=shapes,
+    annotations=annotations,
+    legend_title_text="Rating",
+    margin=dict(l=10, r=10, t=40, b=10),
+)
+
+fig.update_xaxes(title_text="DWT")
+fig.update_yaxes(title_text="CII (gCO₂ / DWT·nm)")
+
+st.plotly_chart(fig, use_container_width=True)
+
 
 # ---------------------------
 # Filters row: Vessel • Date Range • Voyage
