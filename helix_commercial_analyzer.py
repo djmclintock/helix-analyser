@@ -917,5 +917,16 @@ def main():
     # DASHBOARD VIEWER
     section_dashboard(url, df_filtered)
 
+from cii_streamlit_panel import render_cii_panel
+
+# ... wherever you build your tabs/sections:
+tab_overview, tab_cii, *rest = st.tabs(["Overview", "CII", ...])
+
+with tab_cii:
+    # If you want to default to your server copy of the workbook, pass its path:
+    render_cii_panel(default_workbook_path="/path/to/RF2271G v1 CII Voyage Planning Tool  - updated.xlsx")
+
+
 if __name__ == "__main__":
     main()
+
