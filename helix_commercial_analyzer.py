@@ -54,6 +54,16 @@ except Exception:
 
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
 
+import os, glob
+st.sidebar.caption("— Debug —")
+st.sidebar.write("Streamlit version:", __import__("streamlit").__version__)
+st.sidebar.write("Main file:", __file__)
+st.sidebar.write("CWD:", os.getcwd())
+here = os.path.dirname(__file__)
+st.sidebar.write("Has ./pages:", os.path.isdir(os.path.join(here, "pages")))
+st.sidebar.write("Pages found:", [os.path.basename(p) for p in glob.glob(os.path.join(here, "pages", "*.py"))])
+
+
 def _get_dbapi() -> str:
     try:
         val = st.secrets.get("HELIX_DBAPI", None)
@@ -919,3 +929,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
