@@ -50,6 +50,24 @@ except Exception:
     create_engine = None
     text = None
 
+# --- Streamlit page setup (must be first Streamlit call) ---
+st.set_page_config(page_title="Helix Commercial Analyzer", layout="wide")
+st.title("Helix Commercial Analyzer")
+
+# --- Temporarily disabled notice ---
+st.info(
+    """
+    ⚙️ The Commercial Analyzer module is currently inactive.
+    Please use the pages in the sidebar for:
+    - 🧮 CII
+    - 🌍 EU ETS
+    - ⚡ FuelEU
+    - 🧱 Hull Monitoring
+    """
+)
+st.caption("This page is disabled for internal testing — content hidden intentionally.")
+st.stop()
+
 # -------------------------- App config --------------------------
 
 CONFIG_PATH = os.getenv("HELIX_CONFIG", "helix_config.yaml")
@@ -929,4 +947,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
