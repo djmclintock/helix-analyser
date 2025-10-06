@@ -63,42 +63,50 @@ agg["Deficit_t"]          = (agg["Delta_g_per_MJ"].clip(lower=0) * agg["Energy_M
 agg["Surplus_t"]          = ((-agg["Delta_g_per_MJ"]).clip(lower=0) * agg["Energy_MJ"]) / 1_000_000.0
 
 # -------------------------------------------------------
-# Pooling logic
+# Pooling logic (now computes a signed net)
 # -------------------------------------------------------
 if pooling:
     pool_E_GJ = float(agg["Energy_GJ"].sum())
     pool_CO2e = float(agg["CO2e_t"].sum())
-    pool_int  = (pool_CO2e * 1000.0) / pool_E_GJ
-    pool_delta = pool_int - target
+    pooled_int = (pool_CO2e * 1000.0) / pool_E_GJ if pool_E_GJ > 0 else 0.0
+    pool_delta = pooled_int - target
     pool_MJ = pool_E_GJ * 1000.0
     pool_deficit_t = max(0.0, pool_delta) * pool_MJ / 1_000_000.0
     pool_surplus_t = max(0.0, -pool_delta) * pool_MJ / 1_000_000.0
-    net_deficit_t = pool_deficit_t  # pooling offsets internally
-    net_cost_eur  = net_deficit_t * credit_price
+    net_signed_t = pool_deficit_t - pool_surplus_t  # + = deficit, - = surplus
 else:
-    net_deficit_t = float(agg["Deficit_t"].sum())
-    net_cost_eur  = net_deficit_t * credit_price
+    total_deficit_t = float(agg["Deficit_t"].sum())
+    total_surplus_t = float(agg["Surplus_t"].sum())
+    net_signed_t = total_deficit_t - total_surplus_t  # + = deficit, - = surplus
 
 total_energy = float(agg["Energy_GJ"].sum())
 total_co2e   = float(agg["CO2e_t"].sum())
 pooled_int   = (total_co2e * 1000.0) / total_energy if total_energy > 0 else 0.0
 
+# Cost only if net is a deficit
+net_cost_eur = max(0.0, net_signed_t) * credit_price
+
 # -------------------------------------------------------
-# KPIs
+# KPIs (Net shows +/- with color; cost only if deficit)
 # -------------------------------------------------------
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Total energy (GJ)", f"{total_energy:,.0f}")
 m2.metric("Total CO₂e (t)",    f"{total_co2e:,.0f}")
 m3.metric("Pooled intensity (g/MJ)", f"{pooled_int:,.1f}")
-m4.metric(("Net deficit (t)" if pooling else "Total deficits (t)"), f"{net_deficit_t:,.0f}")
 
+# Net (signed). Positive = deficit (red), Negative = surplus (green)
+net_label = "Net obligation (t)" if pooling else "Net (t)"
+net_value_display = f"{abs(net_signed_t):,.0f}"
+net_delta_display = f"{net_signed_t:+,.0f} t"  # e.g., +1,234 t or -567 t
+m4.metric(net_label, net_value_display, delta=net_delta_display, delta_color="inverse")
+
+# Estimated cost: only on deficits
 st.metric("Estimated cost (€)", f"{net_cost_eur:,.0f}")
-
 st.caption(
-    "Intensity = (tCO₂e × 1000) / GJ → gCO₂e/MJ. "
-    "Deficit_t = max(0, (Intensity − Target)) × Energy(MJ) / 1e6. "
-    "Pooling offsets surpluses vs deficits at fleet level."
+    "Net shown as signed value: **positive (red) = deficit**, **negative (green) = surplus**. "
+    "Estimated cost applies only to deficits: `max(0, net) × price`."
 )
+
 
 # -------------------------------------------------------
 # Table
